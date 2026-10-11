@@ -11,6 +11,12 @@ BUILD_DIR  ?= build
 # STRATA_EXPERIMENTAL_SM60, which needs a CUDA 12.x toolkit (13 dropped sm_61).  `make build CUDA_ARCHS=86` builds for
 # one card and is several times faster.  An arch the installed nvcc cannot compile is dropped with a note.
 CUDA_ARCHS ?= 61;75;86;89
+# PASCAL=1 is our shorthand for CUDA_ARCHS=61 (GTX 10-series, Tesla P40); the arch check above then turns on
+# STRATA_EXPERIMENTAL_SM60 by itself, so the shorthand needs no extra CMake flag.
+PASCAL     ?=
+ifeq ($(PASCAL),1)
+CUDA_ARCHS := 61
+endif
 # nvcc: on PATH, else the toolkit's usual place (RunPod images and distro packages differ).  NVCC=/path overrides.
 NVCC ?= $(or $(shell command -v nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc))
 ifeq ($(NVCC),)
