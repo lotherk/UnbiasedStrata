@@ -41,6 +41,10 @@ namespace {
 
 const char* const kModelName = "qwen3.8-flash-next-iq3_xxs";
 
+// The engine's serve loop refuses a request unless prompt + max_new + this margin fits --ctx
+// (src/program/generate.cpp:6403): the last cells are the engine's own, not ours to hand out.
+constexpr long long kEngineReserve = 8;
+
 struct Options {
     std::string model;                  // shard 1 of the GGUF
     std::string pack;                   // the prepared pack directory
@@ -51,6 +55,7 @@ struct Options {
     int port = 8080;
     long long ctx = 32768;
     int threads = 0;                    // CPU expert workers; 0 = the engine's default (every physical core)
+    bool fit_max_tokens = true;         // shorten a request's max_tokens to the room left instead of refusing it
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
 
@@ -63,6 +68,8 @@ void usage() {
         "  --mmproj PATH   enable image input using this vision encoder (CPU)\n"
         "  --vision-tokens N  maximum tokens per image (default 1024)\n"
         "  --ctx N         context length in tokens (default 32768)\n"
+        "  --fit-max-tokens / --no-fit-max-tokens\n"
+        "                  shorten a request's max_tokens to the room left instead of refusing it (default: on)\n"
         "  --threads N     CPU threads for the experts the GPU does not hold (default: every physical core,\n"
         "                  or half the CPU quota inside a container that has one)\n"
         "  --host ADDR     address to listen on (default 127.0.0.1)\n"
@@ -232,16 +239,26 @@ struct Server {
         // (pi sends max_tokens 32768 on a 64K card) was refused on every prompt longer than ctx - max_tokens.
         constexpr long long kEngineReserve = 8;
         const long long n = (long long) p.ids.size();
-        if (n + 1 + kEngineReserve > opt.ctx) {
-            err = "the prompt is " + std::to_string(n) + " tokens, which does not fit the context of " +
+        const long long room = opt.ctx - n - kEngineReserve;
+        if (room < 1) {
+            err = "the prompt is " + std::to_string(n) + " tokens, which leaves no room to generate in the context of " +
                   std::to_string(opt.ctx);
             return false;
         }
-        long long max_new = opt.ctx - n - kEngineReserve;
+        long long max_new = room;
         for (const char* key : {"max_completion_tokens", "max_tokens"})
             if (body.contains(key) && body.at(key).is_number()) {
                 const long long want = body.at(key).get<long long>();
-                if (want >= 1) max_new = std::min(max_new, want);
+                if (want >= 1) {
+                    if (want <= room) max_new = want;
+                    else if (opt.fit_max_tokens) max_new = room;
+                    else {
+                        err = "the request asks for " + std::to_string(want) + " tokens and the prompt is " +
+                              std::to_string(n) + ", which does not fit the context of " + std::to_string(opt.ctx) +
+                              " (--fit-max-tokens shortens the request to the room left)";
+                        return false;
+                    }
+                }
                 break;
             }
         p.max_new = max_new;
@@ -574,6 +591,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--host") o.host = next("--host");
         else if (a == "--port") o.port = std::atoi(next("--port").c_str());
         else if (a == "--ctx") o.ctx = std::atoll(next("--ctx").c_str());
+        else if (a == "--fit-max-tokens") o.fit_max_tokens = true;
+        else if (a == "--no-fit-max-tokens") o.fit_max_tokens = false;
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
         else if (a == "--") {
             for (++i; i < argc; ++i) {

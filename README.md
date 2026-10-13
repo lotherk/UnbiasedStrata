@@ -42,7 +42,8 @@ cache.
 | | |
 | --- | --- |
 | Endpoints | `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `GET /health`, on `127.0.0.1:8080` |
-| Options | `--ctx N` (32768), `--threads N` (default: physical cores, or half the CPU quota in a container), `--host`, `--port`, `--mmproj PATH`, `--vision-tokens N` (1024); engine flags after `--` |
+| Options | `--ctx N` (32768), `--threads N` (default: physical cores, or half the CPU quota in a container), `--host`, `--port`, `--mmproj PATH`, `--vision-tokens N` (1024), `--fit-max-tokens` / `--no-fit-max-tokens` (default: on); engine flags after `--` |
+| Context | a request whose `max_tokens` would run past `--ctx` has it shortened to the room left; with `--no-fit-max-tokens` it is refused (400) instead |
 | Sampling | greedy unless `temperature` > 0 |
 | Reasoning | returned as `reasoning_content`; `"reasoning_effort": "none"` turns it off |
 | Tools | OpenAI format (`tools`, `tool_calls`) |
