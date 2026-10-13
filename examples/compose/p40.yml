@@ -1,0 +1,62 @@
+# p40.yml -- run the unbiased-strata container on a Pascal Tesla P40 (sm_61).
+#
+# The image is this repository's sm_61 build (make build PASCAL=1), the
+# experimental path for GTX 10-series / Tesla P40 / P100:
+#   CUDA_ARCHS=61, STRATA_EXPERIMENTAL_SM60=ON.
+#
+# Validated on this machine (the P40 host that this example was written on):
+#   GPUs:     Tesla P40 24 GB x2 (one is used here), plus a GTX 1060 6 GB
+#   CPU:      AMD Ryzen 7 3700X            (8 physical cores / 16 threads)
+#   RAM/swap: 62 GiB / 63 GiB
+#   OS:       Debian GNU/Linux 13 (trixie)
+#   Driver:   NVIDIA 580.178.04
+#   Docker:   26.1.5, Compose v2.26.1, NVIDIA Container Toolkit 1.20.1
+#
+# Data you must supply beside this file before `docker compose up`:
+#   ./models/       the model's GGUF shards (shard 2 must sit next to shard 1)
+#   ./strata-data/  the prepared pack and MTP directories, e.g.
+#                     strata-data/pack-iq3-xxs/
+#                     strata-data/mtp/
+#
+# Run with:  docker compose -f examples/compose/p40.yml up -d
+#
+# Adjust to your host: the GPU device index (device_ids), the cpuset/cpus for
+# the CPU expert workers, the model/pack/mtp paths, and the published port.
+
+services:
+  p40:
+    image: unbiased-strata:p40
+    build:
+      context: ../..                    # the repository root (the Dockerfile lives there)
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./models/:/models:ro
+      - ./strata-data/:/strata:ro
+    runtime: nvidia
+    cpuset: 0-5
+    cpus: 6
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]         # one Tesla P40: set this to your P40's index
+              capabilities: [gpu]
+    command:
+      - --model
+      - /models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+      - --pack
+      - /strata/pack-iq3-xxs
+      - --mtp
+      - /strata/mtp
+      - --ctx
+      - "262144"
+      - --threads
+      - "6"
+      - --host
+      - "0.0.0.0"                       # 127.0.0.1 is the default; 0.0.0.0 exposes the port
+      - --port
+      - "8080"

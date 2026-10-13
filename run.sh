@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 ./build/unbiased-strata --model /mnt/nvme/stack/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --pack /mnt/nvme/Strata-data/pack-iq3-xxs --mtp /mnt/nvme/Strata-data/mtp --ctx 262144
