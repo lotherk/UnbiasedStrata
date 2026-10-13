@@ -26,6 +26,12 @@ ssh host 'cd UnbiasedStrata && make build'      # produces build/unbiased-strata
 The tree is 6 MB plus the pinned llama.cpp submodule in `third_party/` (about 170 MB checked out). The
 build fetches nothing. `make build JOBS=N` sets the job count; `CUDA_ARCHS` defaults to `86;89;120`.
 
+Pascal is an experimental, community build: `make build PASCAL=1` compiles sm_61 (GTX 10-series, Tesla P40;
+`CUDA_ARCHS=60` for P100) and turns on the engine's `STRATA_EXPERIMENTAL_SM60` path. It needs a CUDA 12.x
+toolkit (CUDA 13 dropped sm_60/sm_70) and is outside the validated configuration above: no tensor cores, so
+expect the portable FP32 attention path and much lower throughput, and a card under 24 GB leans on the expert
+cache.
+
 ## Run
 
 ```
