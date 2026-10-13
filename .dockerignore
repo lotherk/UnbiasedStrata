@@ -1,0 +1,16 @@
+# Keep the image to the source the build needs.  third_party/llama.cpp (the
+# pinned submodule) is NOT ignored: make build compiles it.
+
+# git metadata (the submodule's .git file points outside the context)
+.git
+**/.git
+
+# cmake output from host builds
+build
+build/
+build*/
+
+# not needed by the build
+docs
+data
+*.log
