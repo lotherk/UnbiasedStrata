@@ -5405,6 +5405,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
+        // DRY's tokenized sequence breakers: device arrays on the head's device, allocated once (the pointers must
+        // stay put for the captured coupled-draft graph) and refilled per request from the request's `dry_breakers`.
+        constexpr int kDryBreakersCap = 64;    // restart sequences a request may name
+        constexpr int kDryFlatCap = 1024;      // token ids over all of them
+        int32_t* d_dry_flat = nullptr;
+        int32_t* d_dry_off = nullptr;
+        {
+            const strata::core::OnDevice on_h(hist_dev);
+            if (cudaMalloc(&d_dry_flat, kDryFlatCap * sizeof(int32_t)) != cudaSuccess ||
+                cudaMalloc(&d_dry_off, (kDryBreakersCap + 1) * sizeof(int32_t)) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: the DRY-breaker allocation failed\n");
+                return 1;
+            }
+        }
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
@@ -6631,6 +6645,11 @@ int main(int argc, char** argv) {
             unsigned long long req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
+            // DRY (llama.cpp's `dry` sampler): `dry_breakers` is the tokenizer's restart sequences, sequences
+            // separated by '|' and their ids by ',' (the front end tokenizes them; this engine has no tokenizer).
+            float req_dry_multiplier = 0.0f, req_dry_base = 1.75f;
+            int req_dry_allowed_length = 2, req_dry_penalty_last_n = 0;
+            std::string req_dry_breakers;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
@@ -6656,6 +6675,11 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
+                    else if (key == "dry_multiplier") req_dry_multiplier = fv;
+                    else if (key == "dry_base") req_dry_base = fv;
+                    else if (key == "dry_allowed_length") req_dry_allowed_length = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "dry_penalty_last_n") req_dry_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "dry_breakers") req_dry_breakers = tok.substr(eq + 1);
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
@@ -7329,15 +7353,47 @@ int main(int argc, char** argv) {
             req_sp.penalty_repeat = req_penalty_repeat;
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
+            req_sp.dry_multiplier = req_dry_multiplier;
+            req_sp.dry_base = req_dry_base;
+            req_sp.dry_allowed_length = std::max(req_dry_allowed_length, 0);
+            req_sp.dry_penalty_last_n = std::max(req_dry_penalty_last_n, 0);
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
             mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            // DRY's tokenized breakers, parsed from "id,id|id|...": flatten the sequences and upload them.  The
+            // device arrays are stable (allocated once), so the captured coupled-draft graph keeps valid pointers.
+            std::vector<int32_t> dry_flat, dry_off(1, 0);
+            if (!req_dry_breakers.empty()) {
+                for (size_t p = 0; p < req_dry_breakers.size() && (int) dry_off.size() <= kDryBreakersCap;) {
+                    const size_t bar = req_dry_breakers.find('|', p);
+                    const size_t end = bar == std::string::npos ? req_dry_breakers.size() : bar;
+                    for (size_t q = p; q < end && (int) dry_flat.size() < kDryFlatCap;) {
+                        const size_t comma = req_dry_breakers.find(',', q);
+                        const size_t e2 = (comma == std::string::npos || comma > end) ? end : comma;
+                        if (e2 > q) dry_flat.push_back(std::atoi(req_dry_breakers.substr(q, e2 - q).c_str()));
+                        q = comma == std::string::npos || comma >= end ? end : comma + 1;
+                    }
+                    dry_off.push_back((int32_t) dry_flat.size());
+                    p = bar == std::string::npos ? req_dry_breakers.size() : bar + 1;
+                }
+            }
+            strata::kernels::DryBreakers req_br;
+            if (!dry_flat.empty() && dry_off.size() > 1) {
+                const strata::core::OnDevice on_h(hist_dev);
+                cudaMemcpy(d_dry_flat, dry_flat.data(), (size_t) dry_flat.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_dry_off, dry_off.data(), (size_t) dry_off.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                req_br = strata::kernels::DryBreakers{d_dry_flat, d_dry_off, (int) dry_off.size() - 1};
+            }
+            ver.set_breakers(req_br);
+            mtp.set_draft_breakers(req_br);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
-            const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
+            // DRY builds its window from the same history row the penalties count, so a DRY-only request (no
+            // penalties) still stages history, sized to the wider of the two windows.
+            const int hist_n = std::min(std::max(req_sp.penalty_last_n, req_sp.dry_penalty_last_n), kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);

@@ -152,8 +152,57 @@ int main(int argc, char** argv) {
     assert(server.prepare(request, budgeted, error));
     assert(!budgeted.thinking && budgeted.reasoning_budget == 0);
     request.erase("reasoning_effort");
+    // Sampling header: the launch-time defaults, overridden by a request's own fields; greedy is preserved;
+    // penalties apply even in greedy and get llama.cpp's 64-token window when none is set.
+    {
+        const common_json empty = common_json::parse_no_throw(R"({"messages":[]})");
+        Options neutral;
+        assert(sampling_keys(empty, neutral, server.vocab).empty());   // greedy, no penalties: exactly the old header
+
+        Options tuned = neutral;
+        tuned.temperature = 0.7; tuned.top_p = 0.9; tuned.top_k = 40; tuned.min_p = 0.05;
+        tuned.repeat_penalty = 1.05; tuned.presence_penalty = 0.3; tuned.frequency_penalty = 0.2;
+        tuned.repeat_last_n = 256; tuned.seed = 42;
+        const std::string k = sampling_keys(empty, tuned, server.vocab);
+        for (const char* s : {" temperature=0.7", " top_p=0.9", " top_k=40", " seed=42", " min_p=0.05",
+                              " penalty_repeat=1.05", " penalty_present=0.3", " penalty_freq=0.2",
+                              " penalty_last_n=256"})
+            assert(k.find(s) != std::string::npos);
+
+        // a request's own fields win; the ones it omits keep the launch default
+        const common_json override_body = common_json::parse_no_throw(
+            R"({"messages":[],"temperature":0.2,"top_k":8,"repeat_penalty":1.1,"repeat_last_n":512})");
+        const std::string ko = sampling_keys(override_body, tuned, server.vocab);
+        for (const char* s : {" temperature=0.2", " top_k=8", " top_p=0.9", " penalty_repeat=1.1",
+                              " penalty_last_n=512"})
+            assert(ko.find(s) != std::string::npos);
+
+        // the greedy path honors penalties too, so a penalty applies with no temperature
+        const common_json penalty_body = common_json::parse_no_throw(R"({"messages":[],"presence_penalty":0.5})");
+        const std::string kp = sampling_keys(penalty_body, neutral, server.vocab);
+        assert(kp.find("temperature") == std::string::npos);
+        assert(kp.find(" penalty_present=0.5") != std::string::npos);
+        assert(kp.find(" penalty_last_n=64") != std::string::npos);
+
+        // DRY: emitted only when the multiplier and the window are both set; the default breakers are tokenized
+        // here (the engine has no tokenizer) and encoded as ids; a request's own list wins.
+        Options dry = neutral;
+        dry.dry_multiplier = 0.8; dry.dry_base = 1.75; dry.dry_allowed_length = 2; dry.dry_penalty_last_n = 256;
+        const std::string kd = sampling_keys(empty, dry, server.vocab);
+        for (const char* s : {" dry_multiplier=0.8", " dry_base=1.75", " dry_allowed_length=2",
+                              " dry_penalty_last_n=256", " dry_breakers="})
+            assert(kd.find(s) != std::string::npos);
+        assert(sampling_keys(empty, neutral, server.vocab).find("dry_") == std::string::npos);
+        const common_json dry_body = common_json::parse_no_throw(
+            R"({"messages":[],"dry_multiplier":0.5,"dry_penalty_last_n":128,"dry_sequence_breakers":["\n"]})");
+        const std::string kb = sampling_keys(dry_body, neutral, server.vocab);
+        assert(kb.find(" dry_multiplier=0.5") != std::string::npos);
+        assert(kb.find(" dry_penalty_last_n=128") != std::string::npos);
+        assert(kb.find(" dry_breakers=") != std::string::npos);
+    }
     llama_model_free(server.model);
     std::puts("PASS: omitted parallel_tool_calls uses the model capability; explicit false remains honored; "
               "tool arguments parse in any order; the answer streams as it grows and tool calls arrive whole; "
-              "reasoning_budget_tokens and its message override the command line");
+              "reasoning_budget_tokens and its message override the command line; the sampling header honors the "
+              "launch defaults, a request's overrides, greedy and the penalty window");
 }

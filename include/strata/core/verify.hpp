@@ -100,6 +100,14 @@ public:
         if (next_) next_->set_sampling(sp);
     }
 
+    /// The DRY restart sequences (tokenized; device pointers) the head's sampler uses.  Only the last stage
+    /// holds the head, so this forwards down a layer split like set_sampling; null (`n == 0`) is the default and
+    /// leaves the sampler byte-for-byte neutral.  The buffers must stay alive across the request.
+    void set_breakers(const strata::kernels::DryBreakers& b) {
+        br_ = b;
+        if (next_) next_->set_breakers(b);
+    }
+
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
     /// front slots -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t - staging
@@ -260,6 +268,7 @@ private:
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
+    strata::kernels::DryBreakers br_ = {};   ///< DRY sequence breakers for the head's sampling (set_breakers)
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph

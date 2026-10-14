@@ -25,7 +25,38 @@ struct SamplerParams {
     uint64_t seed = 0;           // drives Philox, which is counter-based on (seed, token index)
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
+    // DRY (llama.cpp's `dry` sampler, applied straight after the penalties above): a token that would EXTEND a
+    // repeat longer than `dry_allowed_length` loses `dry_multiplier * dry_base^(repeat - allowed_length)`, over
+    // the last `dry_penalty_last_n` history tokens.  Restart sequences cap the repeat length.  `dry_multiplier`
+    // 0, `dry_base` < 1, or `dry_penalty_last_n` 0 disables it (llama.cpp's `dry_enabled`).  Only the last
+    // `kDryWindowCap` window tokens are examined; a longer `dry_penalty_last_n` is clamped there.
+    float dry_multiplier = 0.0f;
+    float dry_base = 1.75f;
+    int dry_allowed_length = 2;
+    int dry_penalty_last_n = 0;    // 0 disables; the window over `history`, the same row the penalties count
 };
+
+// The DRY Z-algorithm runs in DEVICE SHARED memory, one window per row: the cap bounds that window (and the
+// sequence-breaker scan).  llama.cpp's default is 256; the engine's penalty window may be wider (up to 4096).
+constexpr int kDryWindowCap = 512;
+
+// DRY sequence breakers, tokenized (llama.cpp's `dry_processed_breakers`): `n` restart sequences, sequence k is
+// `flat[off[k] .. off[k+1])`, its head `flat[off[k]]` and its tail the rest.  A head with an empty tail is a
+// single-token sequence and is never penalised.  DEVICE pointers; `n == 0` means no breakers.
+struct DryBreakers {
+    const int* flat = nullptr;
+    const int* off = nullptr;
+    int n = 0;
+};
+
+// `dry_enabled` (llama.cpp's condition): the multiplier, the base and a non-zero window must all agree.  Both the
+// host launch path and the device kernels call it, so it is host-and-device (the header is not CUDA-only).
+#if defined(__CUDACC__)
+__host__ __device__
+#endif
+inline bool dry_enabled(const SamplerParams& p) {
+    return p.dry_multiplier != 0.0f && p.dry_base >= 1.0f && p.dry_penalty_last_n != 0;
+}
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //
@@ -37,10 +68,12 @@ struct SamplerParams {
 //
 // `history` is (n_tokens, history_len) int32 - ONE ROW PER TOKEN ROW, at a stride of `history_len` - the most
 // recent tokens that row's pick follows, with any unused slots set to -1; only the last `p.penalty_last_n` of
-// each row are counted, and ids outside [0, n_vocab) are ignored.  Pass nullptr and 0 when no penalties apply.
+// each row are counted, and ids outside [0, n_vocab) are ignored.  DRY counts over the last `p.dry_penalty_last_n`
+// of the SAME row; `breakers` are its tokenized restart sequences (a head with an empty tail is a single-token
+// sequence and is never penalised), `n == 0` for none.  Pass history nullptr and 0 when no penalties apply.
 // A verify window's rows need DIFFERENT histories: row t follows the window's drafts 1..t (`penalty_rows`).
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                   const SamplerParams& p, int* out, void* stream);
+                   const SamplerParams& p, int* out, void* stream, const DryBreakers& breakers = DryBreakers{});
 
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
 // sample_tokens' one-block argmax, which takes it unless STRATA_ARGMAX_MULTI=0.  False (nothing launched) where it
@@ -63,7 +96,8 @@ void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapp
 // the id to ring[cap + j].
 void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
                           const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
-                          void* scratch, int32_t* out_id, float* out_prob, void* stream);
+                          void* scratch, int32_t* out_id, float* out_prob, void* stream,
+                          const DryBreakers& breakers = DryBreakers{});
 
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.

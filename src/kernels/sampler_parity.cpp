@@ -20,6 +20,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -29,6 +30,65 @@ void check(cudaError_t e, const char* what) {
         std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+// ---- DRY host reference, transcribed from llama.cpp's `llama_sampler_dry_apply` (Step 1 restart sequences,
+// then a NAIVE repeat-length computation in place of the Z-algorithm: an independent check of the device's
+// Z-array).  `hist` is the row, oldest to newest; only its last `dry_penalty_last_n` entries are read.  The
+// result is token -> maximum repeat length, from which Step 4 subtracts `multiplier * base^(len - allowed)`.
+std::unordered_map<int, int> host_dry_map(const std::vector<int>& hist, const strata::kernels::SamplerParams& p,
+                                          const std::vector<std::vector<int>>& breakers) {
+    std::unordered_map<int, int> out;
+    if (!strata::kernels::dry_enabled(p)) return out;
+    const int dlen = (int) std::min<size_t>((size_t) std::max(p.dry_penalty_last_n, 0), hist.size());
+    if (dlen <= p.dry_allowed_length) return out;
+    auto rat = [&](int x) { return hist[(size_t) (dlen - 1 - x)]; };   // rat(0) is the newest token
+    int rep_limit = dlen;
+    for (int i = 0; i < dlen; ++i) {
+        const int token = rat(i);
+        int longest = -1;
+        for (const auto& s : breakers) {
+            if (s.empty() || s[0] != token) continue;
+            const int sl = (int) s.size() - 1;                         // the tail length (head already matched)
+            if (sl > longest && sl <= i) {
+                bool match = true;
+                for (int off = 0; off < sl; ++off)
+                    if (s[(size_t) (1 + off)] != rat(i - off - 1)) { match = false; break; }
+                if (match) longest = sl;
+            }
+        }
+        if (longest >= 0) { rep_limit = i - longest; break; }
+    }
+    if (rep_limit < p.dry_allowed_length) return out;
+    const int last = dlen - 1;
+    std::vector<int> drep((size_t) dlen, 0);
+    for (int k = 1; k < dlen; ++k) {
+        int n = 0;
+        while (n + k < dlen && rat(n) == rat(n + k)) ++n;
+        drep[(size_t) (last - k)] = std::min(n, rep_limit);
+    }
+    for (int i = 0; i < dlen - 1; ++i) {
+        const int repeat_len = drep[(size_t) i];
+        if (repeat_len >= p.dry_allowed_length) {
+            const int token = rat(dlen - 2 - i);
+            auto it = out.find(token);
+            if (it == out.end() || it->second < repeat_len) out[token] = repeat_len;
+        }
+    }
+    return out;
+}
+
+bool host_single_token_breaker(int id, const std::vector<std::vector<int>>& breakers) {
+    for (const auto& s : breakers) if (s.size() == 1 && s[0] == id) return true;
+    return false;
+}
+
+float host_dry_penalty(int repeat_len, const strata::kernels::SamplerParams& p) {
+    int max_exponent = 0;
+    if (p.dry_base > 1.000001f) max_exponent = (int) (88.7228391f / std::log(p.dry_base));
+    int e = repeat_len - p.dry_allowed_length;
+    if (max_exponent > 0 && e > max_exponent) e = max_exponent;
+    return p.dry_multiplier * std::pow(p.dry_base, (float) e);
 }
 
 // The host reference for the specified order: top_k -> top_p -> temperature -> argmax.
@@ -102,7 +162,8 @@ int reference_cut(const std::vector<float>& l, const strata::kernels::SamplerPar
 }
 
 int run(const char* name, const std::vector<float>& logits, int n_tokens, const strata::kernels::SamplerParams& p,
-        const std::vector<int>& want, const std::vector<int>& hist = {}, int hist_len = 0) {
+        const std::vector<int>& want, const std::vector<int>& hist = {}, int hist_len = 0,
+        const std::vector<std::vector<int>>* breakers = nullptr) {
     float* d_l = nullptr;
     int* d_o = nullptr;
     check(cudaMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
@@ -116,8 +177,27 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
         check(cudaMalloc(&d_h, hist.size() * sizeof(int)), "malloc hist");
         check(cudaMemcpy(d_h, hist.data(), hist.size() * sizeof(int), cudaMemcpyHostToDevice), "copy hist");
     }
+    // The DRY breakers as the device wants them: a flat id array plus `n + 1` offsets.
+    strata::kernels::DryBreakers br;
+    int* d_bf = nullptr;
+    int* d_bo = nullptr;
+    std::vector<int> flat, off;
+    if (breakers != nullptr && !breakers->empty()) {
+        off.push_back(0);
+        for (const auto& s : *breakers) {
+            for (int id : s) flat.push_back(id);
+            off.push_back((int) flat.size());
+        }
+        check(cudaMalloc(&d_bf, flat.size() * sizeof(int)), "malloc breakers flat");
+        check(cudaMemcpy(d_bf, flat.data(), flat.size() * sizeof(int), cudaMemcpyHostToDevice), "copy breakers flat");
+        check(cudaMalloc(&d_bo, off.size() * sizeof(int)), "malloc breakers off");
+        check(cudaMemcpy(d_bo, off.data(), off.size() * sizeof(int), cudaMemcpyHostToDevice), "copy breakers off");
+        br.flat = d_bf;
+        br.off = d_bo;
+        br.n = (int) breakers->size();
+    }
     strata::kernels::sample_tokens(d_l, n_tokens, (int) (logits.size() / n_tokens), d_h, hist_len, p, d_o,
-                                   nullptr);
+                                   nullptr, br);
     std::vector<int> got((size_t) n_tokens);
     check(cudaMemcpy(got.data(), d_o, got.size() * sizeof(int), cudaMemcpyDeviceToHost), "back");
     int bad = 0;
@@ -128,6 +208,8 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
     cudaFree(d_l);
     cudaFree(d_o);
     if (d_h) cudaFree(d_h);
+    if (d_bf) cudaFree(d_bf);
+    if (d_bo) cudaFree(d_bo);
     return bad;
 }
 
@@ -162,11 +244,18 @@ float host_philox_uniform(uint64_t seed, uint64_t counter) {
 // the top_k list, the min_p prefix cut on its survivors, the temperature, and one Philox draw at
 // (seed, counter + row).  One penalties stage (issue #53: this reference used to repeat the kernel's second one).
 int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
-                      const strata::kernels::SamplerParams& p, int row) {
-    auto penal = [&](float logit, int count) {
-        if (count <= 0) return logit;
-        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
-        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+                      const strata::kernels::SamplerParams& p, int row,
+                      const std::vector<std::vector<int>>* breakers = nullptr) {
+    const std::unordered_map<int, int> dry = breakers ? host_dry_map(hist, p, *breakers)
+                                                      : std::unordered_map<int, int>{};
+    auto penal = [&](float logit, int count, int v) {
+        if (count > 0) {
+            if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
+            logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
+        }
+        const auto it = dry.find(v);
+        if (it != dry.end() && !(breakers && host_single_token_breaker(v, *breakers)))
+            logit -= host_dry_penalty(it->second, p);
         return logit;
     };
     auto count = [&](int v) { int c = 0; for (int h : hist) if (h == v) ++c; return c; };
@@ -180,7 +269,7 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
         int best = -1; float bv = 0;
         for (int v = 0; v < nv; ++v) {
             if (taken[(size_t) v]) continue;
-            const float s = penal(l[(size_t) v], count(v));
+            const float s = penal(l[(size_t) v], count(v), v);
             if (best < 0 || s > bv) { best = v; bv = s; }
         }
         taken[(size_t) best] = 1;
@@ -994,6 +1083,65 @@ int main(int argc, char** argv) {
         std::printf("  %-34s %s (%d of %d rows differ)\n", "penalty_rows layout", wrong ? "*** WRONG ***" : "matches",
                     wrong, cases);
         bad += wrong;
+    }
+
+    // ---- fixture 19: DRY (llama.cpp's `dry` sampler).  A window of the last `dry_penalty_last_n` tokens is
+    // scanned for repeats; a token that would EXTEND a repeat longer than `dry_allowed_length` loses
+    // `mult * base^(len - allowed)`.  The window here is 7 9 7 9 7 9 (newest last): the longest repeat is 4 and
+    // the token that continues it is 7, so token 7 is penalised 1.0 * 1.75^2 = 3.0625 and loses to token 9.
+    // Two breaker cases pin Step 1: the single-token breaker [7] makes 7 a restart head and it is NOT penalised
+    // (llama.cpp's empty tail rule); the multi-token breaker [9, 7] caps `rep_limit` at 1 so DRY does nothing.
+    {
+        const int W = 6, NVd = 16;
+        const std::vector<int> win = {7, 9, 7, 9, 7, 9};
+        std::vector<float> row((size_t) NVd, -8.0f);
+        row[7] = 5.0f; row[9] = 4.5f; row[3] = 4.0f;
+
+        strata::kernels::SamplerParams p;
+        p.greedy = true; p.temperature = 0.0f; p.top_k = 0; p.top_p = 1.0f;
+        p.penalty_last_n = 0;                     // DRY only, so the reference's count scan cannot interfere
+        p.dry_multiplier = 1.0f; p.dry_base = 1.75f; p.dry_allowed_length = 2; p.dry_penalty_last_n = W;
+
+        const std::vector<std::vector<int>> none = {};
+        const std::vector<std::vector<int>> single = {{7}};
+        const std::vector<std::vector<int>> multi = {{9, 7}};
+        auto greedy_dry = [&](const std::vector<std::vector<int>>& br) {
+            const std::unordered_map<int, int> map = host_dry_map(win, p, br);
+            int best = 0; float bv = 0; bool first = true;
+            for (int v = 0; v < NVd; ++v) {
+                float s = row[(size_t) v];
+                const auto it = map.find(v);
+                if (it != map.end() && !host_single_token_breaker(v, br)) s -= host_dry_penalty(it->second, p);
+                if (first || s > bv) { bv = s; best = v; first = false; }
+            }
+            return best;
+        };
+        const int d_none = greedy_dry(none), d_single = greedy_dry(single), d_multi = greedy_dry(multi);
+        const bool observable = d_none == 9 && d_single == 7 && d_multi == 7;
+        std::printf("  %-34s %s (dry %d, single-token breaker %d, multi-token breaker %d)\n",
+                    "DRY changes the pick", observable ? "yes" : "*** NO ***", d_none, d_single, d_multi);
+        if (!observable) ++bad;
+        else {
+            bad += run("DRY: no breakers (greedy)", row, 1, p, {d_none}, win, W, &none);
+            bad += run("DRY: single-token breaker", row, 1, p, {d_single}, win, W, &single);
+            bad += run("DRY: multi-token breaker", row, 1, p, {d_multi}, win, W, &multi);
+        }
+
+        // The sampled chain over the same window: the full chain with the host Philox must match draw for draw.
+        // Every row carries the same window, so the history buffer is 64 rows of it (the kernel reads one row
+        // per sampled row at a stride of `history_len`).
+        const int NTd = 64;
+        std::vector<float> l((size_t) NVd * NTd);
+        std::vector<int> hrows((size_t) NTd * W);
+        for (int t = 0; t < NTd; ++t) {
+            std::copy(row.begin(), row.end(), l.begin() + (size_t) t * NVd);
+            std::copy(win.begin(), win.end(), hrows.begin() + (size_t) t * W);
+        }
+        strata::kernels::SamplerParams sp = p;
+        sp.greedy = false; sp.temperature = 1.0f; sp.top_k = 4; sp.top_p = 1.0f; sp.seed = 19; sp.counter = 0;
+        std::vector<int> want((size_t) NTd);
+        for (int t = 0; t < NTd; ++t) want[(size_t) t] = sampled_reference(row, win, sp, t, &none);
+        bad += run("DRY: sampled chain", l, NTd, sp, want, hrows, W, &none);
     }
 
     // A continuous stream and individual decode calls consume the same draw counters.

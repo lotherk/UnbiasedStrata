@@ -80,6 +80,9 @@ public:
     /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
     /// greedy one keeps the argmax drafts and their graphs.  A no-op when the switch is off.
     void set_draft_sampling(const strata::kernels::SamplerParams& sp);
+    /// Coupled mode: the request's DRY sequence breakers (device pointers, alive across the request), used by the
+    /// draft chain so a drafted token follows the same DRY rule the verifying row's sample does.  Empty for none.
+    void set_draft_breakers(const strata::kernels::DryBreakers& br) { draft_br_ = br; }
     /// Coupled mode with penalties: the history the next draft() chain starts from - what the session holds after the
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
@@ -157,6 +160,7 @@ private:
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
     strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
+    strata::kernels::DryBreakers draft_br_ = {};   ///< set_draft_breakers: the coupled chain's DRY breakers
     int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;
     void* cscratch_ = nullptr;
     const float* f32(const char* name) const;

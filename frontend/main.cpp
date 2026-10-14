@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +75,25 @@ struct Options {
     double ram_cap_gib = 0.0;           // --ram-cap: bounds the engine's RAM expert tier and pinned arena
     long long reasoning_budget = 0;     // cap the thinking of every request (0: no cap; a request can set its own)
     std::string reasoning_budget_message = kDefaultReasoningBudgetMessage;   // injected before the end tag
+    // Sampling defaults: a request's own fields win over these.  Temperature <= 0 keeps the documented default
+    // (greedy) and emits no filters, exactly as before; the rest are the engine's own neutral values, so an
+    // unconfigured front end changes nothing.
+    double temperature = 0.0;           // > 0 samples; 0 (default) is greedy
+    double top_p = 0.95;
+    long long top_k = 20;               // the engine's sampler takes 1..64
+    double min_p = 0.0;                 // 0 disables
+    long long repeat_last_n = 0;        // penalty window; 0 with a penalty set falls back to 64
+    double repeat_penalty = 1.0;        // 1.0 disables
+    double presence_penalty = 0.0;      // 0.0 disables
+    double frequency_penalty = 0.0;     // 0.0 disables
+    // DRY (llama.cpp's `dry` sampler): breaks looping generations by penalising a token that would extend a
+    // repeat longer than `dry_allowed_length`.  Off unless the multiplier and the window are both set.
+    double dry_multiplier = 0.0;        // 0.0 disables
+    double dry_base = 1.75;             // the exponent base (>= 1)
+    long long dry_allowed_length = 2;   // repeats of this length or less are free
+    long long dry_penalty_last_n = 0;   // the DRY window in tokens (0 disables)
+    std::vector<std::string> dry_breakers;   // restart sequences; empty uses "\n", ":", "\"", "*"
+    long long seed = -1;                // -1: a fresh random seed per request
     std::vector<std::string> extra;     // after `--`: passed to the engine as they are
 };
 
@@ -100,6 +120,23 @@ void usage() {
         "  --port N        port to listen on (default 8080)\n"
         "  --vram-cap MIB  emulate a smaller card: the engine uses at most MIB of VRAM (a 1080 Ti as 6 GB: 5722)\n"
         "  --ram-cap GIB   bound the engine's RAM expert tier and pinned arena to GIB\n\n"
+        "Sampling defaults (a request's own temperature/top_p/top_k/min_p/seed/presence_penalty/\n"
+        "frequency_penalty/repeat_penalty/repeat_last_n wins; greedy unless the effective temperature is > 0):\n"
+        "  --temperature F sampling temperature (default 0 = greedy)\n"
+        "  --top-k N       top-k shortlist, 1..64 (default 20)\n"
+        "  --top-p F       nucleus probability, 0..1 (default 0.95)\n"
+        "  --min-p F       min-p floor, 0..1 (default 0, off)\n"
+        "  --repeat-last-n N   repetition-penalty window in tokens (default 0; a penalty set here or in a\n"
+        "                  request forces at least 64)\n"
+        "  --repeat-penalty F  repetition penalty, > 0 (default 1.0, off)\n"
+        "  --presence-penalty F  presence penalty (default 0.0, off)\n"
+        "  --frequency-penalty F frequency penalty (default 0.0, off)\n"
+        "  --dry-multiplier F  DRY repetition penalty; 0 disables (default 0.0)\n"
+        "  --dry-base F    DRY exponent base, >= 1 (default 1.75)\n"
+        "  --dry-allowed-length N  free repeat length before DRY applies (default 2)\n"
+        "  --dry-penalty-last-n N  the DRY window in tokens; 0 disables (default 0)\n"
+        "  --dry-breakers LIST  restart sequences as literal text separated by '|' (default \n:|\"|*)\n"
+        "  --seed N        sampling seed (default: a fresh random seed per request)\n\n"
         "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health (with the\n"
         "engine's expert tiers and per-token counters: VRAM slots, RAM copies, mapped experts, hits, warm hints,\n"
         "major page faults).\n");
@@ -171,6 +208,75 @@ struct Prepared {
     bool stream = false;
     long long max_new = 0;
 };
+
+/// The sampling keys of one request's engine header: the launch-time defaults (`opt`) with the request's own
+/// OpenAI / llama.cpp fields winning.  Greedy is preserved: an effective temperature <= 0 emits no temperature
+/// and no filters, and the penalties and their window are emitted only when a penalty is actually set (a
+/// non-neutral value).  The order is fixed, so the header is reproducible for a given input.
+std::string sampling_keys(const common_json& body, const Options& opt, const llama_vocab* vocab) {
+    auto number = [&](const char* key, double fallback) {
+        return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : fallback;
+    };
+    auto integer = [&](const char* key, long long fallback) {
+        return body.contains(key) && body.at(key).is_number() ? body.at(key).get<long long>() : fallback;
+    };
+    auto text = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%g", v); return std::string(b); };
+
+    std::string keys;
+    const double temperature = number("temperature", opt.temperature);
+    if (temperature > 0.0) {
+        const double top_p = number("top_p", opt.top_p);
+        const long long top_k = std::max(1LL, std::min(64LL, integer("top_k", opt.top_k)));
+        const double min_p = number("min_p", opt.min_p);
+        const unsigned long long seed = body.contains("seed") && body.at("seed").is_number()
+                                            ? (unsigned long long) body.at("seed").get<long long>()
+                                            : (opt.seed >= 0 ? (unsigned long long) opt.seed : (unsigned long long) std::random_device{}());
+        keys += " temperature=" + text(temperature) + " top_p=" + text(top_p) +
+                " top_k=" + std::to_string(top_k) + " seed=" + std::to_string(seed);
+        if (min_p > 0.0) keys += " min_p=" + text(min_p);
+    }
+    // llama.cpp's names: presence_penalty, frequency_penalty, repeat_penalty; repeat_last_n is the window.
+    const double penalty_repeat = number("repeat_penalty", opt.repeat_penalty);
+    const double penalty_freq = number("frequency_penalty", opt.frequency_penalty);
+    const double penalty_present = number("presence_penalty", opt.presence_penalty);
+    if (penalty_repeat != 1.0 || penalty_freq != 0.0 || penalty_present != 0.0) {
+        if (penalty_repeat != 1.0) keys += " penalty_repeat=" + text(penalty_repeat);
+        if (penalty_freq != 0.0) keys += " penalty_freq=" + text(penalty_freq);
+        if (penalty_present != 0.0) keys += " penalty_present=" + text(penalty_present);
+        // a penalty with a zero window is a no-op in the sampler, so give it llama.cpp's default of 64
+        const long long window = integer("repeat_last_n", integer("penalty_last_n", opt.repeat_last_n));
+        keys += " penalty_last_n=" + std::to_string(window > 0 ? window : 64);
+    }
+    // DRY (llama.cpp's `dry`): emitted only when it is actually on (multiplier and window both set).  The restart
+    // sequences are tokenized here - the engine has no tokenizer - and sent as ids ("id,id|id|...", sequences by
+    // '|'); a request's own `dry_sequence_breakers` array wins over the launch-time list, else llama.cpp's default.
+    const double dry_multiplier = number("dry_multiplier", opt.dry_multiplier);
+    const long long dry_window = integer("dry_penalty_last_n", opt.dry_penalty_last_n);
+    if (dry_multiplier != 0.0 && dry_window != 0) {
+        const double dry_base = number("dry_base", opt.dry_base);
+        const long long dry_allowed = std::max(0LL, integer("dry_allowed_length", opt.dry_allowed_length));
+        std::vector<std::string> breakers = opt.dry_breakers;
+        if (body.contains("dry_sequence_breakers") && body.at("dry_sequence_breakers").is_array()) {
+            breakers.clear();
+            for (const auto& e : body.at("dry_sequence_breakers"))
+                if (e.is_string()) breakers.push_back(e.get<std::string>());
+        }
+        if (breakers.empty()) breakers = {"\n", ":", "\"", "*"};
+        std::string enc;
+        for (const std::string& s : breakers) {
+            if (s.empty()) continue;
+            const std::vector<llama_token> ids = common_tokenize(vocab, s, /*add_special=*/false, /*parse_special=*/true);
+            if (ids.empty()) continue;
+            if (!enc.empty()) enc += '|';
+            for (size_t k = 0; k < ids.size(); ++k) { if (k) enc += ','; enc += std::to_string((long long) ids[k]); }
+        }
+        keys += " dry_multiplier=" + text(dry_multiplier) + " dry_base=" + text(dry_base) +
+                " dry_allowed_length=" + std::to_string(dry_allowed) +
+                " dry_penalty_last_n=" + std::to_string(dry_window);
+        if (!enc.empty()) keys += " dry_breakers=" + enc;
+    }
+    return keys;
+}
 
 /// The parse of one response as its text grows: what has been published, and what to publish next.
 ///
@@ -376,34 +482,8 @@ struct Server {
         p.max_new = max_new;
         p.stream = body.value("stream", false);
 
-        // sampling: greedy unless the request sets a temperature above zero
-        std::string keys;
-        const double temperature = body.contains("temperature") && body.at("temperature").is_number()
-                                       ? body.at("temperature").get<double>() : 0.0;
-        if (temperature > 0.0) {
-            const double top_p = body.contains("top_p") && body.at("top_p").is_number() ? body.at("top_p").get<double>() : 0.95;
-            long long top_k = body.contains("top_k") && body.at("top_k").is_number() ? body.at("top_k").get<long long>() : 20;
-            top_k = std::max(1LL, std::min(64LL, top_k));       // the engine's sampler takes 1..64
-            unsigned long long seed;
-            if (body.contains("seed") && body.at("seed").is_number()) seed = (unsigned long long) body.at("seed").get<long long>();
-            else seed = std::random_device{}();
-            char b[160];
-            std::snprintf(b, sizeof b, " temperature=%g top_p=%g top_k=%lld seed=%llu", temperature, top_p, top_k, seed);
-            keys += b;
-            if (body.contains("min_p") && body.at("min_p").is_number()) {
-                std::snprintf(b, sizeof b, " min_p=%g", body.at("min_p").get<double>());
-                keys += b;
-            }
-        }
-        for (const auto& kv : {std::pair<const char*, const char*>{"presence_penalty", "penalty_present"},
-                               std::pair<const char*, const char*>{"frequency_penalty", "penalty_freq"},
-                               std::pair<const char*, const char*>{"repeat_penalty", "penalty_repeat"}})
-            if (body.contains(kv.first) && body.at(kv.first).is_number()) {
-                char b[64];
-                std::snprintf(b, sizeof b, " %s=%g", kv.second, body.at(kv.first).get<double>());
-                keys += b;
-                if (keys.find("penalty_last_n") == std::string::npos) keys += " penalty_last_n=64";
-            }
+        // sampling: the launch-time defaults with the request's own fields winning (see sampling_keys)
+        const std::string keys = sampling_keys(body, opt, vocab);
         // The header's parts are kept so a continuation (a thinking budget wrap-up) can rebuild it with a smaller
         // max_new; the assembled header is byte-for-byte the one this fork always sent.
         p.gen_prefix = p.images ? "GENI " : "GEN ";
@@ -749,6 +829,30 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--threads") o.threads = std::atoi(next("--threads").c_str());
         else if (a == "--vram-cap") o.vram_cap_mib = std::atoll(next("--vram-cap").c_str());
         else if (a == "--ram-cap") o.ram_cap_gib = std::atof(next("--ram-cap").c_str());
+        else if (a == "--temperature" || a == "--temp") o.temperature = std::atof(next("--temperature").c_str());
+        else if (a == "--top-k") o.top_k = std::atoll(next("--top-k").c_str());
+        else if (a == "--top-p") o.top_p = std::atof(next("--top-p").c_str());
+        else if (a == "--min-p") o.min_p = std::atof(next("--min-p").c_str());
+        else if (a == "--repeat-last-n") o.repeat_last_n = std::atoll(next("--repeat-last-n").c_str());
+        else if (a == "--repeat-penalty") o.repeat_penalty = std::atof(next("--repeat-penalty").c_str());
+        else if (a == "--presence-penalty") o.presence_penalty = std::atof(next("--presence-penalty").c_str());
+        else if (a == "--frequency-penalty") o.frequency_penalty = std::atof(next("--frequency-penalty").c_str());
+        else if (a == "--dry-multiplier") o.dry_multiplier = std::atof(next("--dry-multiplier").c_str());
+        else if (a == "--dry-base") o.dry_base = std::atof(next("--dry-base").c_str());
+        else if (a == "--dry-allowed-length") o.dry_allowed_length = std::atoll(next("--dry-allowed-length").c_str());
+        else if (a == "--dry-penalty-last-n") o.dry_penalty_last_n = std::atoll(next("--dry-penalty-last-n").c_str());
+        else if (a == "--dry-breakers") {
+            const std::string list = next("--dry-breakers");
+            o.dry_breakers.clear();
+            for (size_t p = 0; p <= list.size();) {
+                const size_t bar = list.find('|', p);
+                const size_t end = bar == std::string::npos ? list.size() : bar;
+                o.dry_breakers.push_back(list.substr(p, end - p));
+                if (bar == std::string::npos) break;
+                p = bar + 1;
+            }
+        }
+        else if (a == "--seed") o.seed = std::atoll(next("--seed").c_str());
         else if (a == "--") {
             for (++i; i < argc; ++i) {
                 const std::string e = argv[i];
@@ -767,6 +871,16 @@ bool parse_args(int argc, char** argv, Options& o) {
     }
     if (o.reasoning_budget < 0) {
         std::fprintf(stderr, "unbiased-strata: --reasoning-budget-tokens must be 0 or more (0: no budget)\n\n");
+        return false;
+    }
+    if (!std::isfinite(o.temperature) || !std::isfinite(o.top_p) || !std::isfinite(o.min_p) ||
+        !std::isfinite(o.repeat_penalty) || !std::isfinite(o.presence_penalty) || !std::isfinite(o.frequency_penalty) ||
+        !std::isfinite(o.dry_multiplier) || !std::isfinite(o.dry_base) ||
+        o.repeat_penalty <= 0.0 || o.top_p <= 0.0 || o.top_p > 1.0 || o.min_p < 0.0 || o.min_p > 1.0 ||
+        o.repeat_last_n < 0 || o.dry_base < 1.0 || o.dry_allowed_length < 0 || o.dry_penalty_last_n < 0) {
+        std::fprintf(stderr, "unbiased-strata: sampling options must be finite (--repeat-penalty positive, "
+                             "--top-p/--min-p in 0..1, --repeat-last-n 0 or more, --dry-base >= 1, "
+                             "--dry-allowed-length/--dry-penalty-last-n 0 or more)\n\n");
         return false;
     }
     return !o.model.empty() && !o.pack.empty() && !o.mtp.empty();
