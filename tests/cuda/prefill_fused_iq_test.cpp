@@ -38,7 +38,10 @@ namespace {
 namespace mmq = strata::prefill::mmq;
 namespace fused = strata::prefill::fused;
 
-constexpr int N = 2560, FF = 640, K = 10, GROUP = 16;
+// the geometry under test: Flash-Next's 2560 / 640 top-10, then Qwen3.6's 2048 / 512 top-8 (the reference part runs
+// both; the timings keep the pack they were measured on)
+int N = 2560, FF = 640, K = 10;
+constexpr int GROUP = 16;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -70,7 +73,7 @@ struct Geo {
     fused::NativeGeom native(const Pair& p) const {
         fused::NativeGeom g;
         g.gu_type = (int) p.gu; g.d_type = (int) p.d; g.gu_row = gu_row; g.d_row = d_row; g.up_off = up_off;
-        g.down_off = down_off;
+        g.down_off = down_off; g.n_embd = N; g.n_ff = FF;
         return g;
     }
 };
@@ -160,9 +163,9 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
     MmqBufs(const Pair& p, int64_t rows, int E)
-        : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 1280 * 4), h((size_t) rows * FF * 4),
+        : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 2 * FF * 4), h((size_t) rows * FF * 4),
           hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident((size_t) rows * 4),
-          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, 1280, N) + 4096),
+          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, 2 * FF, N) + 4096),
           grp_d(GROUP * mmq::matrix_bytes(p.d, N, FF) + 4096) {}
 };
 // `direct`: no gathers - the products read the blobs where they are (they must lie at a fixed stride, every expert
@@ -170,7 +173,7 @@ struct MmqBufs {
 void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const Routing& r, const float* x_dev,
              const int32_t* src_dev, const std::vector<const uint8_t*>& blob, int64_t rows, cudaStream_t s,
              bool direct = false, size_t stride = 0) {
-    const size_t gub = mmq::matrix_bytes(p.gu, 1280, N), db = mmq::matrix_bytes(p.d, N, FF);
+    const size_t gub = mmq::matrix_bytes(p.gu, 2 * FF, N), db = mmq::matrix_bytes(p.d, N, FF);
     const int E = (int) r.cnt.size();
     std::vector<int32_t> order;
     for (int e = 0; e < E; ++e) if (r.cnt[(size_t) e] > 0) order.push_back(e);
@@ -202,12 +205,12 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         }
         const uint8_t* b0 = blob[(size_t) order[j0]];
         mmq::Product gu;
-        gu.w = direct ? (const void*) b0 : b.grp_gu.p; gu.type = (int) p.gu; gu.w_rows = 1280; gu.w_cols = N;
+        gu.w = direct ? (const void*) b0 : b.grp_gu.p; gu.type = (int) p.gu; gu.w_rows = 2 * FF; gu.w_cols = N;
         gu.expert_bytes = direct ? stride : gub;
         gu.n = ngx; gu.xq = b.xq.p; gu.bounds = b.bounds.as<int32_t>() + j0; gu.ids = b.ident.as<int32_t>();
-        gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 1280;
+        gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 2 * FF;
         ctx.run(gu, s);
-        mmq::swiglu(b.gu.as<float>() + r0 * 1280, b.h.as<float>() + r0 * FF, nr, FF, false, s);
+        mmq::swiglu(b.gu.as<float>() + r0 * 2 * FF, b.h.as<float>() + r0 * FF, nr, FF, false, s);
         mmq::quantize(b.h.as<float>() + r0 * FF, nullptr, b.hq.p, (int) p.d, FF, FF, nr, s);
         mmq::Product dn;
         dn.w = direct ? (const void*) (b0 + geo.down_off) : b.grp_d.p; dn.type = (int) p.d; dn.w_rows = N; dn.w_cols = FF;
@@ -610,12 +613,18 @@ int main(int argc, char** argv) {
         }
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
-        for (const Pair& p : pairs) {
-            if (only && std::string(p.name).find(only) == std::string::npos) continue;
-            if (!fused::native_supported((int) p.gu, (int) p.d))
-                throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
-            if (ref) reference_part(p, s);
+        struct Geom { int n, ff, k; const char* model; };
+        for (const Geom& gm : {Geom{2560, 640, 10, "Flash-Next"}, Geom{2048, 512, 8, "Qwen3.6"}}) {
+            N = gm.n; FF = gm.ff; K = gm.k;
+            std::printf("== %s geometry: n_embd %d, n_ff %d, top-%d\n", gm.model, N, FF, K);
+            for (const Pair& p : pairs) {
+                if (only && std::string(p.name).find(only) == std::string::npos) continue;
+                if (!fused::native_supported((int) p.gu, (int) p.d))
+                    throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
+                if (ref) reference_part(p, s);
+            }
         }
+        N = 2560; FF = 640; K = 10;
         if (timing) {
             // the IQ2_XS pack's layers (34 of 48 IQ2_S / Q2_0, 11 IQ2_XXS / Q2_0), the IQ3_S pack's most common, IQ3_XXS's
             for (const Pair& p : {pairs[0], pairs[1], pairs[4], pairs[3]}) {

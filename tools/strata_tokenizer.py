@@ -19,7 +19,10 @@ import json
 import pathlib
 import sys
 
-import regex
+try:
+    import regex
+except ImportError:           # the pack export (`extract`) needs no pattern; `encode` says so if it is asked
+    regex = None
 
 # ------------------------------------------------------------------ byte <-> unicode (GPT-2 byte-level BPE)
 def bytes_to_unicode() -> dict[int, str]:
@@ -86,7 +89,9 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        # Without the `regex` module (the VMs' system python) the export still works: vocab, merges, token types
+        # and the template need no pattern.  Encoding does, and `_encode_plain` refuses by name instead.
+        self._re = regex.compile(QWEN35_PATTERN) if regex is not None else None
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -113,7 +118,7 @@ class Tokenizer:
 
     @staticmethod
     def _alt(literals: list[str]):
-        if not literals:
+        if not literals or regex is None:
             return None
         return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
 
@@ -203,6 +208,9 @@ class Tokenizer:
         return [s for s in parts if s is not None]
 
     def _encode_plain(self, text: str) -> list[int]:
+        if self._re is None:
+            raise ImportError("tokenizing needs the `regex` module (pip install regex): the qwen35 pre-tokenizer "
+                              "pattern uses \\p{L} / \\p{M} classes the standard `re` does not have")
         out: list[int] = []
         for piece in self._re.findall(text):
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))

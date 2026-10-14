@@ -36,6 +36,16 @@ For ordinary quants, --compat-bf16 dequantizes the small projections that the en
 round-to-nearest-even. This introduces BF16 rounding; it does not reconstruct the original full-precision
 weights. Experts, native attention projections, token embeddings, a Q2_0/Q8_0 PLE key and the disk-backed PLE
 table stay unchanged.
+
+Qwen3.6-35B-A3B (`general.architecture` qwen35moe; docs/qwen36-port/step4-pack.md) is a second FORM table, not a
+rewrite of Flash-Next's: the routers, `ssm_alpha`, `ssm_beta` and the 1-D shared-expert gate are F32 in the shipped
+files with every value exactly BF16, so they are written as BF16 under the exact rule above (no --compat-bf16); the
+norms, `ssm_a`, `ssm_dt.bias` and `ssm_conv1d` are F32 and copied; every projection (`attn_qkv`, `attn_gate`,
+`ssm_out`, `attn_q/k/v/output`, `ffn_*_shexp`, `output`, `token_embd`) is served natively from the GGUF and must
+be of a type the engine's native path has a kernel for (NATIVE_PROJECTION_TYPES below) - any other is refused by
+name.  The draft block of a -MTP file (`blk.40` and up, `nextn_predict_layers`) belongs to the drafter's pack and is
+left out of index.txt, dense.bin and native_experts.txt alike.  `expert-profile.bin` (the expert cache's ranking,
+tools/make_profile.py) is copied in from --expert-profile when its header matches the trunk's layers x experts.
 """
 from __future__ import annotations
 
@@ -84,21 +94,75 @@ FORM = {
     "ple_norm_query.weight": "F32", "ssm_a": "F32", "ssm_conv1d.weight": "F32", "ssm_dt.bias": "F32",
     "ssm_norm.weight": "F32",
 }
+# qwen35moe (Qwen3.6-35B-A3B, docs/QWEN36-35B-A3B.md 3.5, 3.7; docs/qwen36-port/step4-pack.md): the plain residual
+# block's norms in place of the hc_* set, no indexer, no PLE.  The engine's forms (src/core/layout.cpp `check_one`
+# and the kernels behind it): the router and the GDN gate projections BF16 (`moe_route`, `fused_gdn_ab`, the prefill
+# `bf16_proj`), the shared expert's 1-D gate BF16 (`shared_expert`), every norm, `ssm_a`, `ssm_dt.bias` and
+# `ssm_conv1d` F32 (read as `const float*`).  The BF16 ones are F32 in both shipped files with every value exactly
+# BF16 (step3-gdn.md's census), so the exact rule writes them without --compat-bf16.
+FORM_QWEN35MOE = {
+    "ffn_gate_inp.weight": "BF16", "ffn_gate_inp_shexp.weight": "BF16",
+    "ssm_alpha.weight": "BF16", "ssm_beta.weight": "BF16",
+    "attn_norm.weight": "F32", "post_attention_norm.weight": "F32", "output_norm.weight": "F32",
+    "attn_q_norm.weight": "F32", "attn_k_norm.weight": "F32", "ssm_norm.weight": "F32",
+    "ssm_a": "F32", "ssm_dt.bias": "F32", "ssm_conv1d.weight": "F32",
+}
+FORMS = {"qwen4exp": FORM, "qwen35moe": FORM_QWEN35MOE}
+# The qwen35moe tensors the engine serves natively from the GGUF (`NativeDense::load`'s eligible suffixes, the native
+# head and the native embedding), and the ggml types each path has a kernel for: `native_mmvq_supported`
+# (src/kernels/cuda/native_mmvq.cu) for the projections and the head, `embed_type_supported` (iq_kernels.cu: the
+# `is_iq` set plus BF16) for the embedding.  A projection of any other type is refused by name: the engine has no
+# F32 / F16 GEMV and would refuse the pack at start-up ("this pack holds the tensor only in its GGUF form").
+NATIVE_PROJECTIONS_QWEN35MOE = (
+    "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",                      # GDN layers
+    "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",      # attention layers
+    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",      # the shared expert, every layer
+)
+NATIVE_PROJECTION_TYPES = {"Q4_0", "Q5_0", "Q5_1", "Q8_0", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ4_NL", "IQ4_XS",
+                           "Q2_0", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ2_S", "IQ1_M"}
+NATIVE_EMBED_TYPES = {"Q5_0", "Q5_1", "Q8_0", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ4_NL", "IQ4_XS", "Q2_0",
+                      "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ2_S", "IQ1_M", "BF16"}
 # PLE key encodings left in the GGUF for the engine's native PLE key (Q2_0; Q8_0 in UD-Q4_K_XL).  Other quantized
 # keys take the BF16 path (--compat-bf16), as before.
 NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 
 
-def form_of(name: str):
-    return FORM.get(re.sub(r"^blk\.\d+\.", "", name))
+def form_of(name: str, arch: str = "qwen4exp"):
+    return FORMS.get(arch, FORM).get(re.sub(r"^blk\.\d+\.", "", name))
 
 
-def needs_bf16(name: str, type_name: str) -> bool:
+def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
     """Whether the engine reads `name` as BF16 from the pack (not natively from the GGUF)."""
     if name == "blk.1.ple_key.weight" and type_name in NATIVE_PLE_KEY:
         return False
-    return form_of(name) == "BF16"
+    return form_of(name, arch) == "BF16"
+
+
+def native_type_problem(name: str, type_name: str, arch: str):
+    """For a qwen35moe tensor the engine serves from the GGUF: None when its type has a native kernel, else the
+    refusal (the tensor, its type, the path and the types that path takes)."""
+    if arch != "qwen35moe":
+        return None
+    suffix = re.sub(r"^blk\.\d+\.", "", name)
+    if name == "token_embd.weight":
+        path, ok = "native embedding (iq_embed_rows)", NATIVE_EMBED_TYPES
+    elif name == "output.weight":
+        path, ok = "native head (native_mmvq)", NATIVE_PROJECTION_TYPES
+    elif name.startswith("blk.") and suffix in NATIVE_PROJECTIONS_QWEN35MOE:
+        path, ok = "native projection path (NativeDense, native_mmvq)", NATIVE_PROJECTION_TYPES
+    else:
+        return None
+    if type_name in ok:
+        return None
+    return "%s is %s, which the engine's %s has no kernel for; it serves %s" % (
+        name, type_name, path, ", ".join(sorted(ok)))
+
+
+def layer_of(name: str) -> int:
+    """The block index of a `blk.N.` tensor, -1 for any other."""
+    m = re.match(r"^blk\.(\d+)\.", name)
+    return int(m.group(1)) if m else -1
 
 
 def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
@@ -223,25 +287,32 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
-def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
+def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool, arch: str = "qwen4exp"):
     """The pack form of one tensor the engine reads from dense.bin: (kind, stored bytes, destination bytes,
     record or None), or an error string.  `record` describes a conversion for conversions.json."""
-    form = form_of(name)
+    form = form_of(name, arch)
     if form is None or form == type_name:
         return KIND[type_name], raw.tobytes(), raw.nbytes, None
     values = dequantize(raw, type_name)
     rec = {"src_type": type_name, "dst_type": form}
     if form == "BF16":
         u = values.view(np.uint32) if type_name == "F32" else None
-        if u is not None and not np.count_nonzero(u & 0xFFFF):
+        inexact = int(np.count_nonzero(u & 0xFFFF)) if u is not None else 0
+        if u is not None and not inexact:
             if not np.isfinite(values).all():
                 return f"{name} is F32 with non-finite values; refused rather than converted"
             data = (u >> 16).astype("<u2").tobytes()       # the exact BF16 values
             rec.update(method="f32->bf16: the values are BF16's (low 16 bits zero)", exact=True, max_abs_err=0.0)
             return "4", data, len(data), rec
         if not compat_bf16:
-            what = "F32 with values that are not BF16" if type_name == "F32" else type_name
-            return f"{name} is {what}, but the engine requires BF16; use --compat-bf16 (rounds to nearest-even)"
+            if type_name == "F32":
+                # the count is the finding: the shipped Qwen3.6 files have 0 of these (the checkpoint is BF16 and
+                # the converter stored it as F32), so a non-zero count means another checkpoint or converter
+                what = ("F32 with %d of %d values that are not BF16 (low 16 bits set)" % (inexact, u.size))
+            else:
+                what = type_name
+            return (f"{name} is {what}, but the engine reads it as BF16; --compat-bf16 would round them to "
+                    "nearest-even (a lossy pack, recorded in compat-bf16.json)")
         data = bf16_bytes(raw, type_name)
         got = (np.frombuffer(data, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
         rec.update(method="dequantize->bf16 round-to-nearest-even (--compat-bf16)" if type_name not in FLOAT else
@@ -271,24 +342,42 @@ def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
     return "2", data, len(data), rec
 
 
-def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
+def model_arch(model: Model) -> str:
+    return str(model.files[0].metadata.get("general.architecture", "qwen4exp"))
+
+
+def index_standalone(src, out, model: Model, compat_bf16: bool = False, n_trunk: int = -1) -> int:
     """Every non-expert tensor of the model: the floats the engine reads from the pack into dense.bin in the form it
-    reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
-    todo, problems = [], []
+    reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF.
+    `n_trunk` (a -MTP file's `block_count - nextn_predict_layers`): the draft blocks from `blk.<n_trunk>` up are
+    left out, they are the drafter's pack's; -1 = every block."""
+    arch = model_arch(model)
+    todo, problems, draft = [], [], 0
     for name, (g, t, mm, p) in model.where.items():
         if is_expert(t.name) or t.name in NOT_IN_PACK:
+            continue
+        if n_trunk >= 0 and layer_of(name) >= n_trunk:
+            draft += 1
             continue
         if len(t.shape) > 2:
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
             return 1
         # quantized: served from the GGUF unless the engine reads it from the pack (FORM), which takes
         # --compat-bf16 to dequantize - except the native PLE key encodings
-        form = form_of(name)
+        form = form_of(name, arch)
         native = t.type_name not in FLOAT and (form is None or (
             name == "blk.1.ple_key.weight" and t.type_name in NATIVE_PLE_KEY))
         if t.type_name not in FLOAT and not native and not compat_bf16:
             problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
+        # qwen35moe: a projection the engine must serve natively is refused unless its type has a kernel.  A float
+        # projection is refused too: the engine has no F32 / F16 GEMV, and "written as stored" would only move the
+        # refusal to the engine's start-up
+        why = native_type_problem(name, t.type_name, arch)
+        if why is not None:
+            problems.append(why)
         todo.append((name, g, t, mm, p, native))
+    if draft:
+        print("%d tensors of the draft (nextn) block(s) blk.%d and up are left to the drafter's pack" % (draft, n_trunk))
     # refused before anything is written: the previous pack stays as it was
     if problems:
         for m in problems[:8]:
@@ -309,7 +398,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
                 continue
             raw = tensor_bytes(mm, g, t)
             try:
-                got = convert(name, t.type_name, raw, compat_bf16)
+                got = convert(name, t.type_name, raw, compat_bf16, arch)
             except ValueError as e:
                 got = str(e)
             if isinstance(got, str):
@@ -435,7 +524,19 @@ def expert_layout(model: Model, src: pathlib.Path):
     exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
+    fused = sorted(n for n in exps if n.endswith(".ffn_gate_up_exps.weight"))
+    if fused:
+        return ("%s: the experts are fused (llama.cpp's gate-then-up form); the engine reads separate "
+                "ffn_gate_exps / ffn_up_exps / ffn_down_exps tensors" % fused[0])
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
+    # the MTP files (Qwen3.6 -MTP builds, blk.40) carry the draft block as the last block(s): its experts belong
+    # to the drafter's pack (step 4), not to the trunk's layout, or the engine would route layer 40 of a 40-layer model
+    meta = model.files[0].metadata
+    arch = meta.get("general.architecture", "")
+    nextn = int(meta.get("%s.nextn_predict_layers" % arch, 0) or 0)
+    if nextn:
+        n_layers -= nextn
+        print("%d draft (nextn) block(s) at blk.%d and up are left to the MTP pack; %d trunk layers" % (nextn, n_layers, n_layers))
     n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
     if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
@@ -490,6 +591,25 @@ def read_json(path: pathlib.Path):
         return None
 
 
+def profile_problem(path: pathlib.Path, n_layers: int, n_expert: int):
+    """The expert-cache profile's header (tools/make_profile.py, read by `read_expert_profile`) against this model's
+    trunk: None when it fits, else why not.  The engine would refuse it at start-up with the same numbers; checking
+    here keeps a pack from shipping a ranking for another model."""
+    import struct
+    try:
+        head = path.read_bytes()[:24]
+    except OSError as e:
+        return "%s: %s" % (path, e)
+    if len(head) < 24 or head[:4] != b"STRP":
+        return "%s is not a Strata expert profile (no STRP header)" % path
+    _, nl, ne, slots, n = struct.unpack_from("<5I", head, 4)
+    if (nl, ne) != (n_layers, n_expert):
+        return "%s ranks %d x %d (layers x experts), this model's trunk is %d x %d" % (path, nl, ne, n_layers, n_expert)
+    if n > slots or n > nl * ne:
+        return "%s: %d ranked pairs in %d slots of %d" % (path, n, slots, nl * ne)
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
@@ -501,6 +621,13 @@ def main() -> int:
                          "(rounds weights; leaves experts and the PLE table unchanged)")
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
+    ap.add_argument("--layout-only", action="store_true",
+                    help="write native_experts.txt alone (the per-layer expert formats, blob sizes and offsets) and "
+                         "print the census: the pack-side check of a model file, nothing else is written")
+    ap.add_argument("--expert-profile", metavar="PROFILE.bin",
+                    help="the expert cache's ranking (tools/make_profile.py) to ship as <out>/expert-profile.bin; its "
+                         "header must say this model's trunk layers x experts.  Default: data/qwen36-expert-profile.bin "
+                         "for a qwen35moe model when it exists and fits; none otherwise")
     a = ap.parse_args()
     if a.compat_bf16 and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
@@ -522,6 +649,32 @@ def main() -> int:
         print(got)
         return 1
     layout, text, n_expert, offset = got
+    n_trunk = len(layout)
+    arch = model_arch(model)
+    # the expert cache's ranking: checked against the trunk before anything is written, copied in after the index
+    profile = pathlib.Path(a.expert_profile) if a.expert_profile else None
+    if profile is None and arch == "qwen35moe":
+        default = HERE.parent / "data" / "qwen36-expert-profile.bin"
+        if default.is_file() and profile_problem(default, n_trunk, n_expert) is None:
+            profile = default
+    if profile is not None:
+        why = profile_problem(profile, n_trunk, n_expert)
+        if why:
+            print(why)
+            return 1
+    if a.layout_only:
+        (out / "native_experts.txt").write_text(text, encoding="utf-8")
+        kinds = {}
+        for l, gt, dt, off, blob, ts in layout:
+            kinds.setdefault((ts[0].type_name, ts[2].type_name, blob), []).append(l)
+        print("%s: %d layers x %d experts, %.0f MiB of experts, mean blob %.3f MiB, largest %.3f MiB" % (
+            src.name, len(layout), n_expert, offset / 2 ** 20, offset / n_expert / len(layout) / 2 ** 20,
+            max(b for *_, b, _ in layout) / 2 ** 20))
+        for (gu, dn, blob), ls in sorted(kinds.items(), key=lambda kv: kv[1][0]):
+            print("  gate/up %-8s down %-8s blob %9d B: %s" % (gu, dn, blob,
+                  "layers %s" % ls if len(ls) <= 8 else "%d layers" % len(ls)))
+        print("wrote %s" % (out / "native_experts.txt"))
+        return 0
     path = out / "experts.bin"
     sidecar = out / "experts.bin.src.json"
     want = experts_source(model, text, offset)
@@ -559,12 +712,20 @@ def main() -> int:
         (out / "native_experts.txt").unlink(missing_ok=True)
         rc = index_from_base(a, src, base, out, g, {t.name: t for t in g.tensors}, mm)
     else:
-        rc = index_standalone(src, out, model, a.compat_bf16)
+        rc = index_standalone(src, out, model, a.compat_bf16, n_trunk)
     if rc:
         return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
+    if profile is not None:
+        tmp_prof = out / "expert-profile.bin.tmp"
+        shutil.copyfile(profile, tmp_prof)
+        tmp_prof.replace(out / "expert-profile.bin")
+        print("expert-profile.bin: %s (%d x %d)" % (profile, n_trunk, n_expert))
+    elif arch == "qwen35moe":
+        print("no expert profile shipped (--expert-profile): the engine's --expert-profile needs one of %d x %d"
+              % (n_trunk, n_expert))
 
     # ---- the experts.  native_experts.txt is written to a temporary name and renamed only when every layer is
     # in: a stop part-way (a layer split across shards, #171) left a partial native_experts.txt that the next setup

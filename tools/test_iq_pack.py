@@ -19,11 +19,14 @@ from gguf import GGUFWriter, GGMLQuantizationType as Q, quants
 import iq_pack
 
 
-def write_gguf(path, tensors, split=None, arch=True):
-    """`split` = (no, count, tensors): llama.cpp's gguf-split keys (0-based split.no)."""
-    writer = GGUFWriter(path, "qwen4exp")
+def write_gguf(path, tensors, split=None, arch=True, kv=None, architecture="qwen4exp"):
+    """`split` = (no, count, tensors): llama.cpp's gguf-split keys (0-based split.no); `kv` = extra u32 keys;
+    `architecture` = the general.architecture string (qwen4exp, or qwen35moe for the Qwen3.6 fixtures)."""
+    writer = GGUFWriter(path, architecture)
     if not arch:                                   # a later shard of a split: no model metadata
         writer.kv_data[0].pop("general.architecture", None)
+    for key, value in (kv or {}).items():
+        writer.add_uint32(key, value)
     if split is not None:
         writer.add_uint16("split.no", split[0])
         writer.add_uint16("split.count", split[1])
@@ -165,6 +168,72 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(len(rewritten), len(written))
             self.assertNotEqual(rewritten, written)
             self.assertIn("not rewritten", pack(second))
+
+    def test_layout_only_writes_the_table_and_the_census(self):
+        """--layout-only (the Qwen3.6 port's step 2): native_experts.txt alone, the census printed, nothing else."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            out = root / "pack"
+            path = root / "m.gguf"
+            write_gguf(path, [("blk.%d.ffn_gate_inp.weight" % l, np.ones((4, 32), np.float32), Q.F32)
+                              for l in range(2)] +
+                             [("blk.%d.ffn_%s_exps.weight" % (l, r),
+                               np.arange(4 * 2 * 32, dtype=np.float32).reshape(4, 2, 32) / 256, Q.Q8_0)
+                              for l in range(2) for r in ("gate", "up", "down")])
+            log = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(path), "--out", str(out), "--layout-only"]), \
+                    contextlib.redirect_stdout(log):
+                self.assertEqual(iq_pack.main(), 0)
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["native_experts.txt"])
+            text = (out / "native_experts.txt").read_text()
+            rows = [line.split() for line in text.splitlines() if line and not line.startswith("#")]
+            self.assertEqual([r[0] for r in rows], ["0", "1"])
+            blob = 3 * 2 * 32 * 34 // 32          # gate | up | down, Q8_0 rows of 32 values = 34 bytes
+            self.assertEqual([int(r[4]) for r in rows], [blob, blob])
+            self.assertIn("(n_expert 4, total %d;" % (2 * 4 * blob), text.splitlines()[0])
+            self.assertIn("2 layers x 4 experts", log.getvalue())
+            self.assertIn("gate/up Q8_0     down Q8_0     blob %9d B: layers [0, 1]" % blob, log.getvalue())
+            self.assertIn("wrote %s" % (out / "native_experts.txt"), log.getvalue())
+
+    def test_nextn_block_is_left_out_of_the_layout(self):
+        """nextn_predict_layers 1 (the -MTP files): the last block's experts belong to the drafter's pack."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            out = root / "pack"
+            path = root / "mtp.gguf"
+            write_gguf(path, [("blk.%d.ffn_gate_inp.weight" % l, np.ones((4, 32), np.float32), Q.F32)
+                              for l in range(3)] +
+                             [("blk.%d.ffn_%s_exps.weight" % (l, r),
+                               np.arange(4 * 2 * 32, dtype=np.float32).reshape(4, 2, 32) / 256, Q.Q8_0)
+                              for l in range(3) for r in ("gate", "up", "down")],
+                       kv={"qwen4exp.nextn_predict_layers": 1})
+            log = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(path), "--out", str(out), "--layout-only"]), \
+                    contextlib.redirect_stdout(log):
+                self.assertEqual(iq_pack.main(), 0)
+            rows = [line.split() for line in (out / "native_experts.txt").read_text().splitlines()
+                    if line and not line.startswith("#")]
+            self.assertEqual([r[0] for r in rows], ["0", "1"])
+            self.assertIn("1 draft (nextn) block(s) at blk.2 and up are left to the MTP pack; 2 trunk layers", log.getvalue())
+            self.assertIn("2 layers x 4 experts", log.getvalue())
+
+    def test_fused_gate_up_experts_are_refused_by_name(self):
+        """llama.cpp's fused ffn_gate_up_exps form: refused before anything is written."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            out = root / "pack"
+            path = root / "fused.gguf"
+            write_gguf(path, [("blk.0.ffn_gate_inp.weight", np.ones((4, 32), np.float32), Q.F32),
+                              ("blk.0.ffn_gate_up_exps.weight",
+                               np.arange(4 * 4 * 32, dtype=np.float32).reshape(4, 4, 32) / 256, Q.Q8_0),
+                              ("blk.0.ffn_down_exps.weight",
+                               np.arange(4 * 2 * 32, dtype=np.float32).reshape(4, 2, 32) / 256, Q.Q8_0)])
+            log = io.StringIO()
+            with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(path), "--out", str(out), "--layout-only"]), \
+                    contextlib.redirect_stdout(log):
+                self.assertEqual(iq_pack.main(), 1)
+            self.assertIn("blk.0.ffn_gate_up_exps.weight: the experts are fused", log.getvalue())
+            self.assertFalse((out / "native_experts.txt").exists())
 
     def test_snapshot_symlinks_keep_split_discovery(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -522,6 +591,249 @@ class SplitArtifactTests(unittest.TestCase):
             (pack / "experts.bin").write_bytes(stale)
             rc, log = run_pack(paths[0], pack, "--experts-bin")
             self.assertEqual((pack / "experts.bin").read_bytes(), want)
+
+
+# ---- Qwen3.6-35B-A3B (qwen35moe) in miniature: hidden 64, 2 trunk layers (0 GDN, 1 attention), 4 experts of 32,
+# the shared expert 32 wide, plus (with nextn) a draft block blk.2 of the -MTP files' shape.  The float tensors are
+# stored as the shipped files store them: the routers, ssm_alpha / ssm_beta and the 1-D shexp gate F32 holding BF16
+# values; the norms, ssm_a, ssm_dt.bias and ssm_conv1d F32; every projection quantized (Q8_0 here, Q6_K / Q8_0 in
+# the files).
+Q36_H, Q36_E, Q36_FF, Q36_HV, Q36_C, Q36_V, Q36_VOCAB = 64, 4, 32, 2, 64, 32, 32
+
+
+def bf16_exact(shape, seed):
+    """F32 values whose low 16 bits are zero: BF16 values held as F32, as the shipped files hold them."""
+    x = np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
+    return (x.view(np.uint32) & np.uint32(0xFFFF0000)).view(np.float32)
+
+
+def q36_trunk_layer(l, gdn, router=None, proj_type=Q.Q8_0, proj_values=None):
+    r = np.random.default_rng(100 + l)
+    f32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
+    q = lambda *shape: (proj_values if proj_values is not None else f32(*shape))
+    b = "blk.%d." % l
+    t = [(b + "attn_norm.weight", f32(Q36_H), Q.F32), (b + "post_attention_norm.weight", f32(Q36_H), Q.F32),
+         (b + "ffn_gate_inp.weight", router if router is not None else bf16_exact((Q36_E, Q36_H), l), Q.F32),
+         (b + "ffn_gate_inp_shexp.weight", bf16_exact((Q36_H,), 50 + l), Q.F32),
+         (b + "ffn_gate_shexp.weight", f32(Q36_FF, Q36_H), proj_type),
+         (b + "ffn_up_shexp.weight", f32(Q36_FF, Q36_H), proj_type),
+         (b + "ffn_down_shexp.weight", f32(Q36_H, Q36_FF), proj_type)]
+    t += [(b + "ffn_%s_exps.weight" % role, f32(Q36_E, Q36_FF, Q36_H) if role != "down" else f32(Q36_E, Q36_H, Q36_FF),
+           Q.Q8_0) for role in ("gate", "up", "down")]
+    if gdn:
+        t += [(b + "attn_qkv.weight", q(Q36_C, Q36_H), proj_type), (b + "attn_gate.weight", q(Q36_V, Q36_H), proj_type),
+              (b + "ssm_out.weight", q(Q36_H, Q36_V), proj_type),
+              (b + "ssm_conv1d.weight", f32(Q36_C, 4), Q.F32),
+              (b + "ssm_alpha.weight", bf16_exact((Q36_HV, Q36_H), 60 + l), Q.F32),
+              (b + "ssm_beta.weight", bf16_exact((Q36_HV, Q36_H), 70 + l), Q.F32),
+              (b + "ssm_a", -np.abs(f32(Q36_HV)), Q.F32), (b + "ssm_dt.bias", f32(Q36_HV), Q.F32),
+              (b + "ssm_norm.weight", f32(16), Q.F32)]
+    else:
+        t += [(b + "attn_q.weight", q(128, Q36_H), proj_type), (b + "attn_k.weight", q(32, Q36_H), proj_type),
+              (b + "attn_v.weight", q(32, Q36_H), proj_type), (b + "attn_output.weight", q(Q36_H, Q36_H), proj_type),
+              (b + "attn_q_norm.weight", f32(32), Q.F32), (b + "attn_k_norm.weight", f32(32), Q.F32)]
+    return t
+
+
+def q36_model(path, nextn=False, **layer_kw):
+    r = np.random.default_rng(7)
+    f32 = lambda *shape: r.standard_normal(shape).astype(np.float32)
+    tensors = [("token_embd.weight", f32(Q36_VOCAB, Q36_H), Q.Q8_0), ("output.weight", f32(Q36_VOCAB, Q36_H), Q.Q8_0),
+               ("output_norm.weight", f32(Q36_H), Q.F32)]
+    tensors += q36_trunk_layer(0, True, **layer_kw) + q36_trunk_layer(1, False)
+    kv = {}
+    if nextn:
+        # the draft block: an attention layer with MoE, its routers BF16 (as in the -MTP files), plus the nextn set
+        draft = [(n, v, Q.BF16 if n.endswith(("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")) else k)
+                 for n, v, k in q36_trunk_layer(2, False)]
+        draft += [("blk.2.nextn.eh_proj.weight", f32(Q36_H, 2 * Q36_H), Q.Q8_0),
+                  ("blk.2.nextn.enorm.weight", f32(Q36_H), Q.F32), ("blk.2.nextn.hnorm.weight", f32(Q36_H), Q.F32),
+                  ("blk.2.nextn.shared_head_norm.weight", f32(Q36_H), Q.F32)]
+        tensors += draft
+        kv["qwen35moe.nextn_predict_layers"] = 1
+    write_gguf(path, tensors, kv=kv, architecture="qwen35moe")
+    return tensors
+
+
+def q36_pack(root, out, *extra, nextn=False, **layer_kw):
+    """Packs a toy model at root/q36.gguf into `out` through main(): (rc, log, tensors)."""
+    path = root / "q36.gguf"
+    tensors = q36_model(path, nextn=nextn, **layer_kw)
+    (out / "tokenizer").mkdir(parents=True, exist_ok=True)
+    for n in ["vocab.json", "chat_template.jinja"]:
+        (out / "tokenizer" / n).touch()
+    buf = io.StringIO()
+    with patch.object(sys, "argv", ["iq_pack.py", "--gguf", str(path), "--out", str(out), *extra]):
+        with contextlib.redirect_stdout(buf):
+            rc = iq_pack.main()
+    return rc, buf.getvalue(), tensors
+
+
+class Qwen36PackTests(unittest.TestCase):
+    """The qwen35moe entry (docs/qwen36-port/step4-pack.md): the forms, the BF16 rule's refusal with its count, the
+    native projection types refused by name, the nextn block left out, index.txt's contents, expert-profile.bin."""
+
+    def test_forms_and_index_contents(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, out = Path(tmp), Path(tmp) / "pack"
+            rc, log, tensors = q36_pack(root, out)
+            self.assertEqual(rc, 0, log)
+            header, rows = iq_pack.read_index(out / "index.txt")
+            dense = (out / "dense.bin").read_bytes()
+            by_name = {n: (v, k) for n, v, k in tensors}
+            # every non-expert tensor has a row, nothing else does, and the header counts them
+            expect = {n for n in by_name if not n.endswith("_exps.weight")}
+            self.assertEqual(set(rows), expect)
+            self.assertIn("tensors %d" % len(expect), header[1])
+            bf16 = {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight", "ssm_alpha.weight", "ssm_beta.weight"}
+            f32 = {"attn_norm.weight", "post_attention_norm.weight", "output_norm.weight", "attn_q_norm.weight",
+                   "attn_k_norm.weight", "ssm_norm.weight", "ssm_a", "ssm_dt.bias", "ssm_conv1d.weight"}
+            native = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "attn_q.weight", "attn_k.weight",
+                      "attn_v.weight", "attn_output.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                      "ffn_down_shexp.weight", "output.weight", "token_embd.weight"}
+            at = 0
+            for name, row in rows.items():
+                suffix = iq_pack.re.sub(r"^blk\.\d+\.", "", name)
+                v, k = by_name[name]
+                ne0, ne1 = int(row[7]), int(row[8])
+                self.assertEqual((ne0, ne1), (v.shape[-1], v.shape[0] if v.ndim == 2 else 0), name)
+                if suffix in bf16:
+                    self.assertEqual(row[2], "4", name)                            # index kind 4: raw BF16
+                    self.assertEqual(int(row[4]), v.size * 2, name)
+                    np.testing.assert_array_equal(stored(rows, dense, name, "<u2"), (v.view(np.uint32) >> 16).ravel())
+                elif suffix in f32:
+                    self.assertEqual(row[2], "2", name)                            # F32 as stored
+                    np.testing.assert_array_equal(stored(rows, dense, name, "<f4"), v.ravel())
+                else:
+                    self.assertIn(suffix, native, name)
+                    self.assertEqual(row[1:5] + [row[6]], ["0"] * 5, name)         # shape only: no bytes, no source
+                    self.assertEqual(int(row[5]), at, name)                        # the running arena offset, 0 B
+                    self.assertEqual((row[9], row[11]), ("8", "32"), name)         # marked quantized: served natively
+                if row[2] != "0":
+                    self.assertEqual(int(row[5]), at, name)                        # 64-aligned arena offsets
+                    self.assertEqual(int(row[3]) % 64, 0, name)
+                    at += (int(row[6]) + 63) // 64 * 64
+            self.assertIn("pool %d" % at, header[1])
+            # conversions.json: the four BF16 forms per GDN layer, two per attention layer, all exact, nothing lossy
+            conv = json.loads((out / "conversions.json").read_text())
+            self.assertEqual(sorted(r["name"] for r in conv["tensors"]),
+                             sorted(n for n in rows if iq_pack.re.sub(r"^blk\.\d+\.", "", n) in bf16))
+            self.assertTrue(all(r["exact"] and r["max_abs_err"] == 0.0 for r in conv["tensors"]))
+            self.assertFalse(conv["compat_bf16"])
+            self.assertFalse((out / "compat-bf16.json").exists())
+            # the expert table: two trunk layers
+            lines = [l for l in (out / "native_experts.txt").read_text().splitlines() if not l.startswith("#")]
+            self.assertEqual([l.split()[0] for l in lines], ["0", "1"])
+            self.assertIn("no expert profile shipped", log)
+            self.assertEqual(sorted(p.name for p in out.iterdir()),
+                             ["conversions.json", "dense.bin", "index.txt", "native_experts.txt", "tokenizer"])
+
+    def test_inexact_router_is_refused_with_the_count(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, out = Path(tmp), Path(tmp) / "pack"
+            router = bf16_exact((Q36_E, Q36_H), 1)
+            router[0, :3] += np.float32(1e-3)                    # three values with low bits set
+            out.mkdir()
+            (out / "dense.bin").write_bytes(b"previous pack")
+            (out / "native_experts.txt").write_bytes(b"previous pack")
+            rc, log, _ = q36_pack(root, out, router=router)
+            self.assertEqual(rc, 1)
+            self.assertIn("blk.0.ffn_gate_inp.weight is F32 with 3 of %d values that are not BF16" % router.size, log)
+            self.assertIn("--compat-bf16 would round them", log)
+            self.assertEqual((out / "dense.bin").read_bytes(), b"previous pack")
+            self.assertEqual((out / "native_experts.txt").read_bytes(), b"previous pack")
+            self.assertFalse((out / "index.txt").exists())
+            rc, log, _ = q36_pack(root, out, "--compat-bf16", router=router)
+            self.assertEqual(rc, 0, log)
+            compat = json.loads((out / "compat-bf16.json").read_text())
+            self.assertEqual([t["name"] for t in compat["tensors"]], ["blk.0.ffn_gate_inp.weight"])
+            conv = {r["name"]: r for r in json.loads((out / "conversions.json").read_text())["tensors"]}
+            self.assertFalse(conv["blk.0.ffn_gate_inp.weight"]["exact"])
+            self.assertTrue(conv["blk.1.ffn_gate_inp.weight"]["exact"])
+
+    def test_projection_types_are_refused_by_name(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, out = Path(tmp), Path(tmp) / "pack"
+            # an F32 GDN projection: the engine has no F32 GEMV
+            rc, log, _ = q36_pack(root, out, proj_type=Q.F32)
+            self.assertEqual(rc, 1)
+            self.assertIn("blk.0.attn_qkv.weight is F32, which the engine's native projection path", log)
+            self.assertIn("Q6_K", log)
+            self.assertIn("Q8_0", log)
+            self.assertFalse((out / "index.txt").exists())
+            self.assertFalse((out / "native_experts.txt").exists())
+            # the head and the embedding have their own lists
+            path = root / "q36.gguf"
+            tensors = [(n, v, k) for n, v, k in q36_model(path)]
+            tensors = [(n, v, Q.F32 if n == "output.weight" else Q.F16 if n == "token_embd.weight" else k)
+                       for n, v, k in tensors]
+            write_gguf(path, tensors, architecture="qwen35moe")
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = iq_pack.index_standalone(path, out, iq_pack.Model(path), False, 2)
+            self.assertEqual(rc, 1)
+            self.assertIn("output.weight is F32, which the engine's native head", buf.getvalue())
+            self.assertIn("token_embd.weight is F16, which the engine's native embedding", buf.getvalue())
+            self.assertIn("BF16", buf.getvalue())                 # the embedding takes BF16, the head does not
+
+    def test_nextn_block_is_left_to_the_drafter(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, out = Path(tmp), Path(tmp) / "pack"
+            rc, log, tensors = q36_pack(root, out, nextn=True)
+            self.assertEqual(rc, 0, log)
+            _, rows = iq_pack.read_index(out / "index.txt")
+            self.assertFalse([n for n in rows if n.startswith("blk.2.")], "the draft block is in the index")
+            self.assertFalse([n for n in rows if "nextn" in n])
+            self.assertEqual(len(rows), len([n for n, _, _ in tensors
+                                             if not n.endswith("_exps.weight") and not n.startswith("blk.2.")]))
+            draft_floats = sum(1 for n, _, k in tensors if n.startswith("blk.2.") and not n.endswith("_exps.weight"))
+            self.assertIn("%d tensors of the draft (nextn) block(s) blk.2 and up are left to the drafter's pack"
+                          % draft_floats, log)
+            self.assertIn("1 draft (nextn) block(s) at blk.2 and up are left to the MTP pack; 2 trunk layers", log)
+            lines = [l for l in (out / "native_experts.txt").read_text().splitlines() if not l.startswith("#")]
+            self.assertEqual([l.split()[0] for l in lines], ["0", "1"])
+            # dense.bin holds exactly the trunk's float tensors: its size is their 64-aligned sum
+            size = 0
+            for n, v, k in tensors:
+                if n.startswith("blk.2.") or n.endswith("_exps.weight") or k != Q.F32:
+                    continue
+                suffix = iq_pack.re.sub(r"^blk\.\d+\.", "", n)
+                nbytes = v.size * (2 if iq_pack.FORM_QWEN35MOE.get(suffix) == "BF16" else 4)
+                size += (nbytes + 63) // 64 * 64
+            self.assertEqual((out / "dense.bin").stat().st_size, size)
+
+    def test_expert_profile_is_checked_and_copied(self):
+        import make_profile as MP
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root, out = Path(tmp), Path(tmp) / "pack"
+            ranked = [(l, e) for l in range(2) for e in range(Q36_E)]
+            MP.write_profile(root / "fits.bin", ranked, Q36_E, 2)
+            MP.write_profile(root / "other.bin", [(l, e) for l in range(3) for e in range(Q36_E)], Q36_E, 3)
+            out.mkdir()
+            (out / "native_experts.txt").write_bytes(b"previous pack")
+            rc, log, _ = q36_pack(root, out, "--expert-profile", str(root / "other.bin"))
+            self.assertEqual(rc, 1)
+            self.assertIn("ranks 3 x 4 (layers x experts), this model's trunk is 2 x 4", log)
+            self.assertEqual((out / "native_experts.txt").read_bytes(), b"previous pack")
+            self.assertFalse((out / "expert-profile.bin").exists())
+            rc, log, _ = q36_pack(root, out, "--expert-profile", str(root / "fits.bin"))
+            self.assertEqual(rc, 0, log)
+            self.assertEqual((out / "expert-profile.bin").read_bytes(), (root / "fits.bin").read_bytes())
+            self.assertIn("expert-profile.bin: %s (2 x 4)" % (root / "fits.bin"), log)
+            self.assertEqual(MP.read_profile(out / "expert-profile.bin", Q36_E, 2), ranked)
+            self.assertFalse(list(out.glob("*.tmp")))
+
+    def test_flash_next_forms_do_not_see_the_qwen36_table(self):
+        """The qwen4exp FORM table is the one it was: the Qwen3.6 names resolve to nothing there, so a Flash-Next
+        tensor by one of those names (none exists) would be written as stored, as before."""
+        for name in ("blk.0.attn_norm.weight", "blk.0.ssm_a", "blk.0.attn_q_norm.weight"):
+            self.assertEqual(iq_pack.form_of(name, "qwen35moe"), "F32")
+        self.assertEqual(iq_pack.form_of("blk.0.ssm_alpha.weight"), "BF16")
+        self.assertEqual(iq_pack.form_of("blk.0.hc_attn_down.weight", "qwen35moe"), None)
+        self.assertEqual(iq_pack.form_of("blk.0.attn_norm.weight"), None)
+        self.assertTrue(iq_pack.needs_bf16("blk.0.ssm_alpha.weight", "F32", "qwen35moe"))
+        self.assertIsNone(iq_pack.native_type_problem("blk.0.attn_qkv.weight", "F32", "qwen4exp"))
+        self.assertIsNone(iq_pack.native_type_problem("blk.0.attn_qkv.weight", "Q6_K", "qwen35moe"))
+        self.assertIsNone(iq_pack.native_type_problem("blk.0.ffn_gate_inp.weight", "F32", "qwen35moe"))
 
 
 if __name__ == "__main__":

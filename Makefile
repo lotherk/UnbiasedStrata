@@ -1,13 +1,18 @@
 # UnbiasedStrata build.  Needs CMake 3.24+, a C++20 compiler and the CUDA toolkit.  Nothing is downloaded.
 BUILD_DIR  ?= build
-# Pascal/Volta are a community, experimental build: `make build PASCAL=1` compiles sm_61 (GTX 10-series,
-# Tesla P40; sm_60/P100 works too, override with CUDA_ARCHS=60) and turns on the engine's
-# STRATA_EXPERIMENTAL_SM60 path (see README.md and src/core/device.cu).  It needs a CUDA 12.x toolkit:
-# CUDA 13 dropped sm_60/sm_70, so the check below fails early with the reason instead of inside nvcc.
+# One binary for every single NVIDIA GPU from Pascal up: GTX 10 (61), Volta (70), RTX 20 / GTX 16 (75), RTX 30 (86),
+# RTX 40 (89), RTX 50 (120).  Pascal and Volta are the experimental build (STRATA_EXPERIMENTAL_SM60; needs a CUDA 12.x
+# toolkit, 13 dropped them): any arch below 75 in the list switches it on.  sm_120 needs CUDA 12.8+.  An arch the
+# installed nvcc cannot compile is dropped from the list with a note (CUDA 12.4 has no 120; CUDA 13 has no 61 / 70),
+# so the default builds on any toolkit; `make build CUDA_ARCHS=61` keeps a single-card build short
+# (docs/qwen36-port/pascal-build.md).
+CUDA_ARCHS ?= 61;70;75;86;89;120
+# `make build PASCAL=1` is the short form of `CUDA_ARCHS=61`: sm_61 (GTX 10-series, Tesla P40; sm_60/P100 works too,
+# override with CUDA_ARCHS=60).  It needs a CUDA 12.x toolkit: CUDA 13 dropped sm_60/sm_70, so the check below fails
+# early with the reason instead of inside nvcc.
 PASCAL     ?=
 ifeq ($(PASCAL),1)
-CUDA_ARCHS ?= 61
-PASCAL_CMAKE_FLAGS := -DSTRATA_EXPERIMENTAL_SM60=ON
+CUDA_ARCHS := 61
 NVCC       ?= $(shell command -v nvcc 2>/dev/null)
 NVCC_MAJOR := $(shell $(NVCC) --version 2>/dev/null | sed -n 's/.*release \([0-9]*\).*/\1/p' | head -n1)
 ifneq ($(NVCC_MAJOR),)
@@ -15,10 +20,17 @@ ifeq ($(shell [ $(NVCC_MAJOR) -ge 13 ] && echo yes),yes)
 $(error PASCAL=1 needs a CUDA 12.x toolkit; nvcc $(NVCC_MAJOR) dropped sm_60/sm_70)
 endif
 endif
-else
-# RTX 30 (86), RTX 40 (89) and RTX 50 (120) in one binary.  sm_120 needs CUDA 12.8+, and upstream recommends 13.0+.
-CUDA_ARCHS ?= 86;89;120
 endif
+NVCC_ARCHS := $(shell nvcc --list-gpu-arch 2>/dev/null | sed 's/compute_//' | tr '\n' ' ')
+ifneq ($(NVCC_ARCHS),)
+  CUDA_ARCHS_DROPPED := $(strip $(foreach a,$(subst ;, ,$(CUDA_ARCHS)),$(if $(filter $(firstword $(subst -, ,$(a))),$(NVCC_ARCHS)),,$(a))))
+  ifneq ($(CUDA_ARCHS_DROPPED),)
+    $(info make: nvcc cannot compile CUDA arch(s) $(CUDA_ARCHS_DROPPED); building without them)
+    CUDA_ARCHS := $(subst $(eval) ,;,$(strip $(foreach a,$(subst ;, ,$(CUDA_ARCHS)),$(if $(filter $(firstword $(subst -, ,$(a))),$(NVCC_ARCHS)),$(a),))))
+  endif
+endif
+SM60 := $(shell echo "$(CUDA_ARCHS)" | tr ';' '\n' | sed 's/-.*//' | grep -E '^[0-9]+$$' | awk '$$1 < 75 { print "ON"; exit }')
+SM60_FLAG := $(if $(SM60),-DSTRATA_EXPERIMENTAL_SM60=ON,)
 # capped: inside a container nproc reports the host's CPUs, not the container's quota
 JOBS       ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
 
@@ -30,8 +42,7 @@ build:
 	@git -C third_party/llama.cpp apply --check --reverse ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch 2>/dev/null || \
 	  git -C third_party/llama.cpp apply ../../patches/llama.cpp-qwen3-coder-any-argument-order.patch
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
-	      -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" \
-	      $(PASCAL_CMAKE_FLAGS)
+	      -DSTRATA_PORTABLE=ON -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_BUILD_TESTS=OFF "-DCMAKE_CUDA_ARCHITECTURES=$(CUDA_ARCHS)" $(SM60_FLAG) $(CMAKE_EXTRA)
 	cmake --build $(BUILD_DIR) -j $(JOBS) --target unbiased-strata
 	@echo "built: $(BUILD_DIR)/unbiased-strata"
 
@@ -63,3 +74,9 @@ test-chat-parser:
 	  $(BUILD_DIR)/ggml/src/libggml.a $(BUILD_DIR)/ggml/src/libggml-cpu.a $(BUILD_DIR)/ggml/src/libggml-base.a \
 	  $(BUILD_DIR)/llama.cpp/common/libllama-common-base.a -lpthread -ldl -lm
 	$(BUILD_DIR)/frontend-tests/chat-parser-test "$(MODEL)"
+
+# Against a running server: a request may ask for more tokens than the context has left (REGINA-112).
+.PHONY: test-serve
+test-serve:
+	@test -n "$(PORT)" || { echo 'set PORT to a running server ([HOST:]PORT)'; exit 2; }
+	python3 tests/python/serve_max_tokens_check.py $(PORT)

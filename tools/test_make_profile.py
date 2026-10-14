@@ -99,6 +99,47 @@ class Main(unittest.TestCase):
             self.run_main([str(trace), "--base", str(base), "--n-expert", str(NE), "--out", str(out)])
             self.assertEqual(MP.read_profile(str(out), NE), full_base())
 
+    def test_text_trace_and_the_layer_count_from_the_flag(self):
+        """Qwen3.6 (step 4): a llama.cpp route trace (`<layer> <e0> ...` lines, `#` headers) at --n-layer 40."""
+        import gzip
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "out.bin"
+            routes = Path(d) / "routes.txt"
+            routes.write_text("# prompt a phase prefill\n3 1 2\n3 1 0\n\n# prompt a phase decode\n39 3 1\n3 1 2\n")
+            self.run_main(["--no-base", "--n-layer", "40", "--n-expert", str(NE), "--text-trace", str(routes),
+                           "--out", str(out)])
+            self.assertEqual(MP.profile_header(str(out))[1:3], (40, NE))
+            ranked = MP.read_profile(str(out), NE, 40)
+            self.assertEqual(ranked[:4], [(3, 1), (3, 2), (3, 0), (39, 1)])      # by count, then the smaller pair
+            self.assertEqual(len(ranked), 40 * NE)
+            self.assertEqual(len(set(ranked)), 40 * NE)
+            # a gzipped trace reads the same; a line outside the geometry is an error, not a skipped pair
+            gz = Path(d) / "routes.txt.gz"
+            with gzip.open(gz, "wt") as f:
+                f.write(routes.read_text())
+            self.assertEqual(MP.read_text_trace(gz, NE, 40), MP.read_text_trace(routes, NE, 40))
+            routes.write_text("40 1 2\n")
+            with self.assertRaisesRegex(SystemExit, "layer 40"):
+                MP.read_text_trace(routes, NE, 40)
+            routes.write_text("3 1 %d\n" % NE)
+            with self.assertRaisesRegex(SystemExit, "outside 40 x %d" % NE):
+                MP.read_text_trace(routes, NE, 40)
+            routes.write_text("3 one 2\n")
+            with self.assertRaisesRegex(SystemExit, "not a route line"):
+                MP.read_text_trace(routes, NE, 40)
+
+    def test_base_header_decides_the_layer_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "base.bin"
+            out = Path(d) / "out.bin"
+            MP.write_profile(str(base), [(l, e) for l in range(40) for e in range(NE)], NE, 40)
+            self.run_main(["--base", str(base), "--n-expert", str(NE), "--out", str(out)])
+            self.assertEqual(MP.profile_header(str(out))[1:3], (40, NE))
+            with self.assertRaisesRegex(SystemExit, "ranks 40 layers, --n-layer says 48"):
+                self.run_main(["--base", str(base), "--n-layer", "48", "--n-expert", str(NE), "--out", str(out)])
+            with self.assertRaisesRegex(SystemExit, "ranks %d experts a layer, --n-expert says 512" % NE):
+                self.run_main(["--base", str(base), "--out", str(out)])
+
 
 if __name__ == "__main__":
     unittest.main()

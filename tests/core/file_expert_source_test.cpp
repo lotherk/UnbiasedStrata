@@ -89,7 +89,7 @@ void test_canonical_layout() {
     TempDirectory dir;
 
     std::string err;
-    const bool layout_ok = expert_layout_load(dir.path.string(), layers, experts, err);
+    const bool layout_ok = expert_layout_load(dir.path.string(), layers, experts, 2560, 640, err);
     require(layout_ok, "could not load canonical layout: " + err);
     create_pack(dir.path, total, {{0, 'a'}, {(uint64_t) BLOB, 'b'}, {layer_bytes, 'c'},
                                   {layer_bytes + (uint64_t) BLOB, 'd'}});
@@ -153,7 +153,7 @@ void test_native_variable_layout() {
     create_pack(dir.path, total, {{0, 'a'}, {(uint64_t) first_fmt.bytes, 'b'},
                                   {layer0_bytes, 'c'}, {layer0_bytes + (uint64_t) second_fmt.bytes, 'd'}});
 
-    const bool layout_ok = expert_layout_load(dir.path.string(), layers, experts, err);
+    const bool layout_ok = expert_layout_load(dir.path.string(), layers, experts, 2560, 640, err);
     require(layout_ok, "could not load synthetic native layout: " + err);
     FileExpertSource source;
     bool opened = source.open(dir.path.string(), layers, experts, err);

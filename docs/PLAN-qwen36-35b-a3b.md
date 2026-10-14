@@ -127,6 +127,13 @@ Constraints across the ladder:
 
 ## 2. Models, the memory hierarchy, and the budget table the engine must reproduce at start
 
+**Decision 2026-10-13 (step 5, the user):** the hierarchy is two tiers, VRAM plus host RAM, assumed to hold the
+expert set; spilling to the NVMe is out of scope.  Measured on the 1080 Ti at Q4_K_XL: 52 tok/s with the set
+pinned in the VM's 35 GB, 12 to 15 tok/s under a 12 GiB bound (disk-bound, the replay's prediction; llama.cpp
+13.4).  The README states the RAM a card needs per quantization; the 12 GiB rows below are kept as the measured
+cost of breaking the assumption, not as a supported rung.  H6 and the disk-read instruments are therefore
+informational.
+
 **The hierarchy on the primary rung is three tiers, by the user's decision:** 11 GB of VRAM in the 1080 Ti,
 about 12 GiB of VM RAM (roughly 9 to 10 GB usable for a pinned expert tier after the OS, the process and
 the KV), then the VM's NVMe disk for the rest. Strata already has the pieces: the VRAM expert cache, the
@@ -230,6 +237,18 @@ Instruments, logged per run (the same three serve the engine later):
 - **Level 1, per point:** a decode-phase kernel timeline (`nsys` or `nvprof`). A script computes busy
   fraction, gap histogram, memcpy vs kernel share (the H2 test), per-token period, profiler overhead.
 - **Level 2:** `perf stat` on the server PID, so gaps match CPU time in ggml matmul threads.
+- **Timeline videos, prefill and decode (added 2026-10-13, the user's standing requirement).** For the
+  engine and for llama.cpp, on the 1080 Ti and the 4090, a real-time video of the request's timeline in the
+  style of `~/projects/ub-strata/strata.mp4`: lanes for CPU cores used (100 ms per-core `/proc/stat`
+  samples), GPU kernels, PCIe H2D / D2H bytes and GPU copy / idle, a playhead, the engine-reported tok/s
+  on completion, and the busy fraction stated both with and without the engine's host-wait spin kernel.
+  Two windows per point: the **prefill** of a long prompt (the regina request's 3.1K prompt, and a 32K
+  prompt where the budget allows) and the **decode** of the short request. Stacked engine-over-llama.cpp
+  comparisons at the fit edges. The traces come from the same nsys / nvprof captures as Level 1, so the
+  profiled request must cover the prefill as well as the decode. Pipeline: `scripts/decode_video_json.py`,
+  `scripts/decode_video_render.swift`, `scripts/render_decode_videos.sh` in regina (adapted from
+  `~/Code/strata-workspace/strata-investigation`); output under
+  `analysis/qwen36-35b-single-gpu-ladder/video/` with a README carrying the method's honesty statements.
 
 | # | Where | Arm | N values | ctx | Question |
 | --- | --- | --- | --- | --- | --- |

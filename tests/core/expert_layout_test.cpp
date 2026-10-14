@@ -53,9 +53,12 @@ struct TempDir {
 
 void write_text(const fs::path& p, const std::string& s) { std::ofstream(p, std::ios::binary) << s; }
 
-bool load(const fs::path& dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool load(const fs::path& dir, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, std::string& err) {
     err.clear();
-    return strata::kernels::cpu::expert_layout_load(dir.string(), n_layers, n_expert, err);
+    return strata::kernels::cpu::expert_layout_load(dir.string(), n_layers, n_expert, n_embd, n_ff, err);
+}
+bool load(const fs::path& dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+    return load(dir, n_layers, n_expert, 2560, 640, err);
 }
 
 // ---- 1. the real packs' files
@@ -103,6 +106,56 @@ void real_packs(const fs::path& data) {
         check(same, std::string(pack) + ": every field as the pre-v4 reader, totals as the header (v" +
                         std::to_string(L.version) + ", n_expert " + std::to_string(L.n_expert) + ")");
     }
+}
+
+// ---- 1b. Qwen3.6-35B-A3B's two files (tools/iq_pack.py --layout-only over the real UD-IQ3_XXS and UD-Q4_K_XL files,
+// 2026-10-11): 40 layers x 256 experts at 2048 x 512.  Loaded with the model's geometry every layer's NativeFmt makes
+// the pack's blob; loaded with Flash-Next's 2560 x 640 (what expert_layout_load passed until the Qwen3.6 port's
+// step 2, geometry-inventory.md row 108) the same files are refused by their numbers.  The per-layer types are
+// the census of docs/QWEN36-35B-A3B.md section 1: IQ2_S gate/up with IQ3_XXS down on 37 layers and IQ4_XS on
+// layers 34, 38, 39; Q4_K/Q5_K on 37 layers, Q4_K/Q6_K on 34 and 38, Q5_K/Q6_K on 39 (the largest blob).
+void qwen36(const fs::path& data) {
+    struct Case { const char* file; int gu, d, d_odd; int64_t blob, blob_odd, blob_39; uint64_t total; };
+    const Case cases[] = {
+        {"qwen36-iq3_xxs.txt", 22, 18, 23, 1073152, 1228800, 1228800, 11108614144ull},
+        {"qwen36-q4_k_xl.txt", 12, 13, 14, 1900544, 2039808, 2301952, 19635634176ull},
+    };
+    for (const Case& c : cases) {
+        TempDir d;
+        fs::copy_file(data / c.file, d.path / "native_experts.txt");
+        std::string err;
+        const bool ok = load(d.path, 40, 256, 2048, 512, err);
+        check(ok, std::string(c.file) + ": loads at the model's 40 x 256 x 2048 x 512" + (ok ? "" : ": " + err));
+        if (ok) {
+            const ExpertLayout& L = strata::kernels::cpu::expert_layout();
+            bool types = L.native && L.n_layers == 40 && L.n_expert == 256 && L.total == c.total && L.max_blob == (uint64_t) c.blob_39;
+            for (int64_t l = 0; l < 40 && types; ++l) {
+                const auto& f = L.fmt[(size_t) l];
+                const bool odd = l == 34 || l == 38 || l == 39;
+                types = f.n_embd == 2048 && f.n_ff == 512 && f.bytes == L.bytes[(size_t) l] &&
+                        f.gu_type == (l == 39 && c.gu == 12 ? 13 : c.gu) && f.d_type == (odd ? c.d_odd : c.d) &&
+                        (int64_t) f.bytes == (l == 39 ? c.blob_39 : odd ? c.blob_odd : c.blob);
+            }
+            check(types, std::string(c.file) + ": per-layer formats and blobs (down " + std::to_string(c.d_odd) +
+                             " on 34/38/39, " + std::to_string(c.blob_39) + " B at layer 39, total " +
+                             std::to_string(c.total) + " B)");
+            const auto& f0 = L.fmt[0];
+            check(f0.up_off == f0.gu_row * 512 && f0.down_off == 2 * f0.up_off && f0.bytes == f0.down_off + f0.d_row * 2048,
+                  std::string(c.file) + ": blob = gate rows | up rows | down rows at 512 and 2048");
+        }
+        // n_ff 640 is not whole 256-value blocks for IQ2_S / Q4_K rows, so native_fmt refuses before the blob is
+        // compared; a geometry that IS whole blocks (2048 x 512 for a 2560 x 640 pack) would reach the blob message.
+        const bool refused = !load(d.path, 40, 256, 2560, 640, err);
+        check(refused && (err.find("not whole blocks") != std::string::npos ||
+                          (err.find("layer 0 blob is") != std::string::npos && err.find("2560 x n_ff 640") != std::string::npos)),
+              std::string(c.file) + ": at Flash-Next's 2560 x 640 refused: " + err.substr(0, 60));
+    }
+    // a pack with no native_experts.txt is the canonical Q2_0 form, which bakes 2560 x 640: refused for a 2048 x 512 model
+    TempDir d;
+    std::string err;
+    check(!load(d.path, 40, 256, 2048, 512, err) && err.find("canonical Q2_0") != std::string::npos,
+          "no native_experts.txt (canonical Q2_0 pack) refused for a 2048 x 512 model: " + err.substr(0, 50));
+    check(load(d.path, 48, 512, 2560, 640, err), "no native_experts.txt at the canonical 2560 x 640 still loads");
 }
 
 // ---- 2. the v4 column and the refusals
@@ -329,9 +382,12 @@ void arena() {
 int main(int argc, char** argv) {
     // `expert_layout_test --real PACK_DIR NATIVE_SHARD`: a real pack's native_experts.txt against its model's files
     // (headers only - check_experts_gguf reads no expert byte)
-    if (argc == 4 && std::string(argv[1]) == "--real") {
+    if ((argc == 4 || argc == 8) && std::string(argv[1]) == "--real") {
+        // optional: N_LAYERS N_EXPERT N_EMBD N_FF (default Flash-Next's 48 512 2560 640; Qwen3.6 is 40 256 2048 512)
         std::string err;
-        if (!load(argv[2], 48, 512, err)) { std::printf("layout refused: %s\n", err.c_str()); return 1; }
+        const int64_t nl = argc == 8 ? std::atoll(argv[4]) : 48, ne = argc == 8 ? std::atoll(argv[5]) : 512;
+        const int64_t nd = argc == 8 ? std::atoll(argv[6]) : 2560, nf = argc == 8 ? std::atoll(argv[7]) : 640;
+        if (!load(argv[2], nl, ne, nd, nf, err)) { std::printf("layout refused: %s\n", err.c_str()); return 1; }
         const ExpertLayout& L = strata::kernels::cpu::expert_layout();
         const bool ok = strata::core::check_experts_gguf(argv[3], L, err);
         size_t split = 0;
@@ -348,6 +404,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     real_packs(argv[1]);
+    qwen36(argv[1]);
     columns();
     arena();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);

@@ -74,6 +74,18 @@ int main() {
     check(!strata::core::write_expert_profile(path, L, E, {{3, 0}}, err), "a pair out of range is refused");
     check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == r0,
           "a refused save keeps the file");
+    // a profile of another model is refused by its numbers: Flash-Next's 48 x 512 against Qwen3.6's 40 x 256
+    // (expert_cache.cpp's header check; the Qwen3.6 port's step 2 negative test)
+    {
+        const std::string other = (dir / "flash-next.bin").string();
+        check(strata::core::write_expert_profile(other, 48, 512, {{47, 511}, {0, 0}}, err), "a 48 x 512 profile written");
+        const bool refused = !strata::core::read_expert_profile(other, 40, 256, back, slots, err);
+        check(refused && err.find("48x512") != std::string::npos && err.find("40x256") != std::string::npos &&
+                  err.find("different artifact") != std::string::npos,
+              "a 48 x 512 profile is refused for a 40 x 256 model, naming both");
+        check(strata::core::read_expert_profile(other, 48, 512, back, slots, err) && back.size() == 2,
+              "the same profile reads for the 48 x 512 model");
+    }
     std::filesystem::remove_all(dir);
     if (fails == 0) std::puts("expert_profile_save_test: OK");
     return fails == 0 ? 0 : 1;
