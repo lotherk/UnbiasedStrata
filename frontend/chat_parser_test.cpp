@@ -126,7 +126,34 @@ int main(int argc, char** argv) {
             assert(!parse.msg.tool_calls[i].id.empty());
         }
     }
+    // #123: reasoning_budget_tokens / reasoning_budget_message - the request's value wins over the command line's,
+    // a bad value is refused, thinking off leaves no budget, and the template's end-of-thinking tags are captured.
+    server.opt.reasoning_budget = 64;
+    server.opt.reasoning_budget_message = "server default";
+    Prepared budgeted;
+    assert(server.prepare(request, budgeted, error));
+    assert(budgeted.thinking);
+    assert(budgeted.reasoning_budget == 64);
+    assert(budgeted.reasoning_budget_message == "server default");
+    assert(!budgeted.thinking_end_tags.empty());
+    request["reasoning_budget_tokens"] = 128;
+    request["reasoning_budget_message"] = "You exhausted your reasoning tokens, come to a conclusion, now!";
+    assert(server.prepare(request, budgeted, error));
+    assert(budgeted.reasoning_budget == 128);
+    assert(budgeted.reasoning_budget_message == "You exhausted your reasoning tokens, come to a conclusion, now!");
+    request.erase("reasoning_budget_message");
+    request.erase("reasoning_budget_tokens");
+    request["reasoning_budget_tokens"] = -1;
+    assert(!server.prepare(request, budgeted, error));
+    request["reasoning_budget_tokens"] = "lots";
+    assert(!server.prepare(request, budgeted, error));
+    request.erase("reasoning_budget_tokens");
+    request["reasoning_effort"] = "none";
+    assert(server.prepare(request, budgeted, error));
+    assert(!budgeted.thinking && budgeted.reasoning_budget == 0);
+    request.erase("reasoning_effort");
     llama_model_free(server.model);
     std::puts("PASS: omitted parallel_tool_calls uses the model capability; explicit false remains honored; "
-              "tool arguments parse in any order; the answer streams as it grows and tool calls arrive whole");
+              "tool arguments parse in any order; the answer streams as it grows and tool calls arrive whole; "
+              "reasoning_budget_tokens and its message override the command line");
 }

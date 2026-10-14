@@ -18,6 +18,7 @@ struct GenResult {
     std::string error;
     std::string finish = "length";
     long long produced = 0, prompt_n = 0, draft_accepted = 0, draft_offered = 0;
+    long long reasoning_tokens = 0;   // #123: tokens generated inside the thinking block (a budget wrap-up included)
     double prompt_ms = 0, decode_ms = 0;
 };
 
