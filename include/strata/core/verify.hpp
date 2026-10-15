@@ -89,6 +89,13 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// Capture the T-token window graph NOW instead of on its first `run`.  cudaGraphInstantiate allocates device
+    /// memory per window size and the exec is never freed (measured ~22-26 MiB per size on a GTX 1070 Ti,
+    /// 2026-10-15), so a size captured lazily spent the reserve one request at a time until an instantiate ran out
+    /// mid-request and the engine died.  `serve` captures every size it can ask for (1..max_t) up front; `run` still
+    /// captures any size that was missed.  False with `err` when the capture fails (the buffers or the exec did not
+    /// fit).  Set `set_split`/`set_pcie_mode` first: the recorded graph depends on them.
+    bool capture_window(int T, std::string& err) { return capture(T, err); }
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }

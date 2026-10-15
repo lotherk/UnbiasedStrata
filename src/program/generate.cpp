@@ -5528,6 +5528,30 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // ---- CAPTURE EVERY WINDOW SIZE HERE, NOT ON THE FIRST REQUEST THAT USES IT.  cudaGraphInstantiate
+        // allocates device memory per size and the exec is never freed (measured ~22-26 MiB per size on a GTX
+        // 1070 Ti, 2026-10-15); a size captured lazily drew on the reserve the cache had been sized against, and a
+        // request that needed a size not yet captured died with "verify: instantiate: out of memory" and took the
+        // engine down with it.  Doing it here makes that cost part of what the free-VRAM check below sees and bounds
+        // it before any request runs; a size that does not fit is reported now, with the way to make room.
+        {
+            const int win_max_t = std::max(o.spec, o.batch);
+            const int64_t kWindowGraphMib = 32;   // one exec per size; 26 MiB measured on the 1070 Ti, rounded up
+            for (int T = 1; T <= win_max_t; ++T) {
+                for (int st = 0; st < n_stages; ++st) {
+                    std::string cerr;
+                    if (!stage_ver(st).capture_window(T, cerr)) {
+                        std::fprintf(stderr, "strata serve: %s\n", cerr.c_str());
+                        std::fprintf(stderr, "strata serve: the verify window needs one captured graph per size "
+                                             "(1..%d), about %lld MiB of VRAM beyond its buffers; it does not fit "
+                                             "beside this cache - lower --max-context, raise --vram-reserve-mib, or "
+                                             "close other programs that use the GPU\n",
+                                     win_max_t, (long long) win_max_t * (long long) kWindowGraphMib);
+                        return 1;
+                    }
+                }
+            }
+        }
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
