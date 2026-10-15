@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <chrono>
 #include <csignal>
 #include <unistd.h>
 
@@ -80,6 +81,26 @@ public:
         }
         req += '\n';
         if (!send(req)) { r.error = "the engine is not running"; return r; }
+        // Live progress (llama.cpp prints while it works; the engine does not).  The engine is silent for the whole
+        // of a long prompt - a 154k-token prompt is minutes at a few tens of tokens a second - and a request that is
+        // merely slow then reads as hung.  One stderr line per STRATA_PROGRESS seconds (default 5, 0 = off), between
+        // the request's start line and the engine's own end-of-request summary, which is unchanged.
+        static const double progress_s = [] {
+            const char* v = std::getenv("STRATA_PROGRESS");
+            if (v == nullptr) return 5.0;
+            const double x = std::atof(v);
+            return x > 0.0 ? x : 0.0;
+        }();
+        auto last_report = std::chrono::steady_clock::now();
+        auto decode_t0 = last_report;
+        long long pp_done = 0, pp_total = (long long) ids.size(), n_out = 0;
+        auto report_ok = [&]() -> bool {
+            if (progress_s <= 0.0) return false;
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - last_report).count() < progress_s) return false;
+            last_report = now;
+            return true;
+        };
         bool stopped = false;
         std::string callback_error;
         std::string line;
@@ -98,6 +119,22 @@ public:
                         send("STOP\n");
                     }
                 }
+                if (++n_out == 1) decode_t0 = std::chrono::steady_clock::now();
+                if (report_ok()) {
+                    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_t0).count();
+                    std::fprintf(stderr, "unbiased-strata: decoding: %lld tokens, %.1f tok/s\n",
+                                 n_out, s > 0.0 ? (double) n_out / s : 0.0);
+                }
+            } else if (line.rfind("PP ", 0) == 0) {
+                long long done = 0, total = 0;
+                double ms = 0.0, tps = 0.0;
+                std::sscanf(line.c_str(), "PP %lld %lld %lf %lf", &done, &total, &ms, &tps);
+                if (done > 0) pp_done = done;
+                if (total > 0) pp_total = total;
+                if (report_ok())
+                    std::fprintf(stderr, "unbiased-strata: prompt processing: %lld/%lld (%.1f%%), %.1f tok/s\n",
+                                 pp_done, pp_total,
+                                 pp_total > 0 ? 100.0 * (double) pp_done / (double) pp_total : 0.0, tps);
             } else if (line.rfind("DONE ", 0) == 0) {
                 char finish[32] = {0};
                 std::sscanf(line.c_str(), "DONE %lld %lld %lf %lf %31s %lld %lld", &r.produced, &r.prompt_n, &r.prompt_ms,
@@ -117,7 +154,7 @@ public:
                 r.error = line.size() > 4 ? line.substr(4) : "the engine reported an error";
                 return r;
             }
-            // PP (prompt progress), RESUME, REUSED and INFO lines need no action here
+            // RESUME, REUSED and INFO lines need no action here (PP is reported above)
         }
         alive_ = false;
         r.error = "the engine exited during the request";

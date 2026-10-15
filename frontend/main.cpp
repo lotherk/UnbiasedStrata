@@ -139,7 +139,9 @@ void usage() {
         "  --seed N        sampling seed (default: a fresh random seed per request)\n\n"
         "Serves POST /v1/chat/completions (OpenAI style, with streaming), GET /v1/models and GET /health (with the\n"
         "engine's expert tiers and per-token counters: VRAM slots, RAM copies, mapped experts, hits, warm hints,\n"
-        "major page faults).\n");
+        "major page faults).\n"
+        "STRATA_PROGRESS=SECONDS prints a prompt-processing/decoding line to stderr every SECONDS while a request\n"
+        "runs (default 5; 0 turns it off).\n");
 }
 
 bool file_exists(const std::string& p) {
