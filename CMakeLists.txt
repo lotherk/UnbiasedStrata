@@ -2230,10 +2230,11 @@ if(STRATA_BUILD_DSV41 AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRAT
       string(REPLACE "\n" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
       string(REPLACE "\t" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
       set(_strata_dsv41_archs "")
-      foreach(_want 70 75 80 86 89 90 100 103 110 120 121)   # oldest tensor-core arch = widest device range
-        if(_want IN _strata_nvcc_archs)
-          set(_strata_dsv41_archs ${_want})
-          break()
+      foreach(_a IN ${_strata_nvcc_archs})
+        if(_a MATCHES "^[0-9]+$" AND _a GREATER_EQUAL 70)
+          if(NOT _strata_dsv41_archs OR _a LESS _strata_dsv41_archs)
+            set(_strata_dsv41_archs ${_a})   # oldest tensor-core arch = widest device range
+          endif()
         endif()
       endforeach()
       if(NOT _strata_dsv41_archs)
