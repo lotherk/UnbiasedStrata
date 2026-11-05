@@ -2226,11 +2226,11 @@ if(STRATA_BUILD_DSV41 AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRAT
     if(_strata_dsv41_below_70)
       execute_process(COMMAND ${CMAKE_CUDA_COMPILER} --list-gpu-arch OUTPUT_VARIABLE _strata_nvcc_archs
                       OUTPUT_STRIP_TRAILING_WHITESPACE)
-      string(REPLACE "compute_" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
-      string(REPLACE "\n" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
-      string(REPLACE "\t" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
+      string(STRIP "${_strata_nvcc_archs}" _strata_nvcc_archs)
+      string(REPLACE "compute_" "" _strata_nvcc_archs "${_strata_nvcc_archs}")
+      string(REPLACE "\n" ";" _strata_nvcc_archs "${_strata_nvcc_archs}")
       set(_strata_dsv41_archs "")
-      foreach(_a IN ${_strata_nvcc_archs})
+      foreach(_a ${_strata_nvcc_archs})
         if(_a MATCHES "^[0-9]+$" AND _a GREATER_EQUAL 70)
           if(NOT _strata_dsv41_archs OR _a LESS _strata_dsv41_archs)
             set(_strata_dsv41_archs ${_a})   # oldest tensor-core arch = widest device range
