@@ -2205,6 +2205,46 @@ if(STRATA_BUILD_DSV41 AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRAT
                              ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
   target_link_libraries(ds4_iq_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} Threads::Threads)
   target_compile_definitions(ds4_iq_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+  # ---- the DSV4.1 engine against a Pascal build (CUDA_ARCHS < 70) ---------------------------------------------
+  # The vendored GGUF/IQ expert kernels go through the tensor cores: `namespace wm = nvcuda::wmma;` at
+  # src/dsv41/ds4_gguf.cu:713 and src/dsv41/ds4_iq.cu:812, guarded only by `#if !defined(STRATA_USE_HIP)` -
+  # upstream never wrote a below-sm_700 branch, and CUDA declares that namespace only from __CUDA_ARCH__ >=
+  # 700 on.  Asked to compile them for sm_61 nvcc dies there ("name must be a namespace name", 25 errors),
+  # so a Pascal CUDA_ARCHS cannot carry this engine; `git diff upstream/main -- src/dsv41` is empty, the
+  # tensor-core requirement is upstream's, not something this fork's update introduced.  strata and
+  # strata-poly keep the requested Pascal arch (the Qwen3.8 path stays sm_61); this third engine is compiled
+  # for the oldest arch the toolkit has at >= 70, so build/bin/strata-dsv41 exists and links.  It needs a
+  # tensor-core GPU to RUN (this box is a GTX 1060 + 2x Tesla P40, compute 6.0/6.1: built, not drivable).
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP)
+    set(_strata_dsv41_below_70 OFF)
+    foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+      string(REGEX REPLACE "-.*$" "" _strata_dsv41_base "${_a}")
+      if(_strata_dsv41_base MATCHES "^[0-9]+$" AND _strata_dsv41_base LESS 70)
+        set(_strata_dsv41_below_70 ON)
+      endif()
+    endforeach()
+    if(_strata_dsv41_below_70)
+      execute_process(COMMAND ${CMAKE_CUDA_COMPILER} --list-gpu-arch OUTPUT_VARIABLE _strata_nvcc_archs
+                      OUTPUT_STRIP_TRAILING_WHITESPACE)
+      string(REPLACE "compute_" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
+      string(REPLACE "\n" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
+      string(REPLACE "\t" " " _strata_nvcc_archs "${_strata_nvcc_archs}")
+      set(_strata_dsv41_archs "")
+      foreach(_want 70 75 80 86 89 90 100 103 110 120 121)   # oldest tensor-core arch = widest device range
+        if(_want IN _strata_nvcc_archs)
+          set(_strata_dsv41_archs ${_want})
+          break()
+        endif()
+      endforeach()
+      if(NOT _strata_dsv41_archs)
+        message(FATAL_ERROR "strata-dsv41 needs tensor cores (sm_70 or newer); ${CMAKE_CUDA_COMPILER} offers no arch >= 70 - drop STRATA_BUILD_DSV41 on this toolkit")
+      endif()
+      foreach(_t strata-dsv41 ds4_tq_test ds4_iq_test)
+        set_property(TARGET ${_t} PROPERTY CUDA_ARCHITECTURES ${_strata_dsv41_archs})
+      endforeach()
+      message(STATUS "Strata: strata-dsv41 (and its tests) compiled for sm_${_strata_dsv41_archs}: nvcuda::wmma needs sm_70+; strata/strata-poly keep ${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
+  endif()
   # the kept conversations' .meta file and prefix matching (ds4_slotmeta.hpp): no GPU, no model
   add_executable(ds4_slot_test tests/dsv41/slot_test.cpp)
   target_include_directories(ds4_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
