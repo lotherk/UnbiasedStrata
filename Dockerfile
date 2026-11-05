@@ -48,7 +48,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# The frontend server binary.
 COPY --from=build /src/build/unbiased-strata /usr/local/bin/unbiased-strata
+# The strata engine binary (needed for GSQ-RCO pack/MTP models like Qwen3.8).
+COPY --from=build /src/build/strata /usr/local/bin/strata
+# The strata-poly engine binary (needed for standard GGUF models like Qwen3.6).
+COPY --from=build /src/build/strata-poly /usr/local/bin/strata-poly
+# The shared library for KQ computation.
+COPY --from=build /src/build/libstrata_kq.so /usr/local/lib/libstrata_kq.so
+RUN ldconfig
 
 EXPOSE 8080
 
