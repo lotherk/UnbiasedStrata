@@ -22,24 +22,9 @@
 # the last 12.x release and still supports Pascal.  Override CUDA_ARCHS to build
 # for another card, e.g. --build-arg CUDA_ARCHS=86 for an RTX 30.
 
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
-
-ARG CUDA_ARCHS=61
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /src
-COPY . .
-
-# third_party/llama.cpp is the pinned submodule; the Makefile applies
-# patches/llama.cpp-qwen3-coder-any-argument-order.patch if it is not already.
-# Its .git pointer names a path outside the context, so drop it: git apply then
-# runs in no-repository mode, which is all the patch step needs.
-RUN rm -rf third_party/llama.cpp/.git \
-    && make build PASCAL=1 CUDA_ARCHS="${CUDA_ARCHS}"
-
+# Pre-built binaries are copied from the host build tree.
+# The Dockerfile does NOT compile from source — strata_kq has known
+# compilation issues in the containerized build environment.
 
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
@@ -48,14 +33,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# The frontend server binary.
-COPY --from=build /src/build/unbiased-strata /usr/local/bin/unbiased-strata
-# The strata engine binary (needed for GSQ-RCO pack/MTP models like Qwen3.8).
-COPY --from=build /src/build/strata /usr/local/bin/strata
-# The strata-poly engine binary (needed for standard GGUF models like Qwen3.6).
-COPY --from=build /src/build/strata-poly /usr/local/bin/strata-poly
+# The C++ frontend server binary (OpenAI-style API).
+COPY build/bin/unbiased-strata /usr/local/bin/unbiased-strata
+# The strata engine binary (GSQ-RCO pack/MTP models like Qwen3.8).
+COPY build/bin/strata /usr/local/bin/strata
+# The strata-poly engine binary (standard GGUF models like Qwen3.6).
+COPY build/bin/strata-poly /usr/local/bin/strata-poly
 # The shared library for KQ computation.
-COPY --from=build /src/build/libstrata_kq.so /usr/local/lib/libstrata_kq.so
+COPY build/bin/libstrata_kq.so /usr/local/lib/libstrata_kq.so
 RUN ldconfig
 
 EXPOSE 8080
